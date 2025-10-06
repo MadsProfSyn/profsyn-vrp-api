@@ -5,6 +5,7 @@ from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 from datetime import datetime, timedelta
 from typing import Tuple, Optional, List, Dict
+import math
 import pytz
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -15,28 +16,54 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# ----------------------------
+# Helpers for travel estimates
+# ----------------------------
+
+def haversine_km(lat1, lng1, lat2, lng2) -> float:
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlng = math.radians(lng2 - lng1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlng/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    return R * c
+
+def fallback_minutes(lat1, lng1, lat2, lng2) -> float:
+    """
+    More realistic fallback:
+      - very short hops (<= 1 km): ~ 3–5 km/h walking/elevator/lobby friction -> ~12–20 min/km unrealistic for vehicle
+        but these are often same-building; keep a minimum of 5 min.
+      - city hops (<= 8 km): use ~ 22–28 km/h avg (signals/parking/etc) -> 25 km/h
+      - cross-town (8–20 km): ~ 35 km/h
+      - longer (20+ km): ~ 65 km/h (motorways)
+    """
+    km = haversine_km(lat1, lng1, lat2, lng2)
+    if km <= 1.0:
+        speed_kmh = 25.0  # keep vehicle-speed assumption; min guard below will enforce realistic floor
+    elif km <= 8.0:
+        speed_kmh = 25.0
+    elif km <= 20.0:
+        speed_kmh = 35.0
+    else:
+        speed_kmh = 65.0
+    minutes = (km / speed_kmh) * 60.0
+    return max(5.0, minutes)  # never below 5 min
+
 def get_travel_time_from_cache(from_lat: float, from_lng: float, 
                                to_lat: float, to_lng: float) -> float:
     """Get cached travel time or return estimate"""
+    if from_lat == to_lat and from_lng == to_lng:
+        return 0.0
     key = f"{from_lng},{from_lat}->{to_lng},{to_lat}"
     result = supabase.table('mapbox_travel_cache').select('minutes').eq('key', key).execute()
-    if result.data:
-        return max(5.0, result.data[0]['minutes'])
-
-    # Haversine fallback if not cached
-    from math import radians, cos, sin, asin, sqrt
-    lon1, lat1, lon2, lat2 = map(radians, [from_lng, from_lat, to_lng, to_lat])
-    dlon = lon2 - lon1
-    dlat = lat2 - lat1
-    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
-    c = 2 * asin(sqrt(a))
-    km = 6371 * c
-    # Assume 40 km/h average speed in Copenhagen
-    minutes = (km / 40) * 60
-    return max(5.0, minutes)
+    if result.data and len(result.data) > 0 and result.data[0].get('minutes') is not None:
+        # Enforce a floor; cached times can be unrealistically low sometimes
+        return max(5.0, float(result.data[0]['minutes']))
+    # Fallback
+    return fallback_minutes(from_lat, from_lng, to_lat, to_lng)
 
 def build_distance_matrix(coords_list: List[Tuple[float, float]]) -> List[List[int]]:
-    """Build travel time matrix using cached data"""
+    """Build travel time matrix in MINUTES (integers)"""
     size = len(coords_list)
     matrix = [[0 for _ in range(size)] for _ in range(size)]
     for i in range(size):
@@ -46,7 +73,7 @@ def build_distance_matrix(coords_list: List[Tuple[float, float]]) -> List[List[i
             lat1, lng1 = coords_list[i]
             lat2, lng2 = coords_list[j]
             travel_time = get_travel_time_from_cache(lat1, lng1, lat2, lng2)
-            matrix[i][j] = max(5, int(travel_time))
+            matrix[i][j] = max(1, int(round(travel_time)))
     return matrix
 
 def round_to_nearest_5_min(dt: datetime) -> datetime:
@@ -55,8 +82,28 @@ def round_to_nearest_5_min(dt: datetime) -> datetime:
     dt += timedelta(minutes=5) - discard if discard else timedelta()
     return dt.replace(second=0, microsecond=0)
 
+# ----------------------------
+# Light "area affinity" helper
+# ----------------------------
+
+def area_bucket(lat: float, lng: float, granularity_deg: float = 0.01) -> Tuple[int, int]:
+    """
+    Bucket coordinates into a coarse grid (~0.01 deg ≈ ~1.1 km).
+    Used to add a small cost penalty when routes jump to a different bucket.
+    """
+    return (int(lat / granularity_deg), int(lng / granularity_deg))
+
+# ---------------------------------
+# Main VRP with home depots & costs
+# ---------------------------------
+
 def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) -> Dict:
-    """Main VRP function adapted for new schema"""
+    """Main VRP function adapted for new schema with:
+       - home depots (start & end)
+       - separate time and cost callbacks
+       - area-jump cost penalty
+       - more realistic fallback speeds
+    """
     print(f"Starting VRP for {len(inspection_ids)} inspections across {len(target_dates)} dates")
 
     # Get inspections
@@ -198,11 +245,13 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
         # Build per-inspection nodes (no dedup)
         inspection_nodes: List[Dict] = []
-        coords: List[Tuple[float, float]] = []
+        job_coords: List[Tuple[float, float]] = []
+        job_area_bucket: List[Tuple[int, int]] = []
         for ins in date_inspections:
             if ins['lat'] and ins['lng']:
                 inspection_nodes.append(ins)                  # keep each inspection as its own node
-                coords.append((ins['lat'], ins['lng']))       # 1:1 with nodes
+                job_coords.append((ins['lat'], ins['lng']))   # 1:1 with nodes
+                job_area_bucket.append(area_bucket(ins['lat'], ins['lng']))
             else:
                 print(f"Skipping inspection at {ins['address']} - missing coordinates")
                 metrics['total_unscheduled'] += 1
@@ -210,53 +259,74 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         if not inspection_nodes:
             continue
 
-        n_real = len(inspection_nodes)
-        print(f"\nNode count (no dedup): {n_real} (should equal number of valid inspections for this date)")
+        n_jobs = len(inspection_nodes)
+        print(f"\nNode count (no dedup): {n_jobs} (should equal number of valid inspections for this date)")
 
-        # --- Eligibility diagnostics ---
-        eligible_counts = defaultdict(int)
-        for ins in inspection_nodes:
-            for insp in date_inspectors:
-                if ins['inspection_type'] in insp['can_do_types']:
-                    eligible_counts[insp['full_name']] += 1
-        print("\nEligible visit counts per inspector:")
-        for insp in date_inspectors:
-            print(f"  {insp['full_name']}: {eligible_counts.get(insp['full_name'], 0)} eligible")
+        # Build list of home depots (one per inspector)
+        home_coords: List[Tuple[float, float]] = [(i['home_lat'], i['home_lng']) for i in date_inspectors]
+        home_area_bucket: List[Tuple[int, int]] = [area_bucket(i['home_lat'], i['home_lng']) for i in date_inspectors]
 
-        print("Building travel matrix...")
+        # Combined coordinate list: homes first, then jobs
+        coords: List[Tuple[float, float]] = home_coords + job_coords
+        # Area buckets aligned with coords
+        area_buckets: List[Tuple[int, int]] = home_area_bucket + job_area_bucket
+
+        print("Building travel matrix (homes + jobs)...")
         matrix = build_distance_matrix(coords)
 
-        # Add dummy depot (no actual location, just for OR-Tools structure)
-        dummy = n_real
+        # Indexing
+        num_vehicles = len(date_inspectors)
+        HOME_OFFSET = 0                      # homes: [0 .. num_vehicles-1]
+        JOB_OFFSET = num_vehicles            # jobs:  [num_vehicles .. num_vehicles + n_jobs - 1]
+        n_real = num_vehicles + n_jobs
+
+        # Add dummy end to close routes if you prefer not to return to home
+        dummy_end = n_real
         for row in matrix:
             row.append(0)
         matrix.append([0] * (n_real + 1))
         n = n_real + 1
 
-        # OR-Tools - all inspectors start/end at dummy depot
-        num_vehicles = len(date_inspectors)
-        starts = [dummy] * num_vehicles
-        ends = [dummy] * num_vehicles
+        # OR-Tools starts/ends: start at each home, end at dummy (or set to home index to return-to-home)
+        starts = list(range(HOME_OFFSET, HOME_OFFSET + num_vehicles))
+        ends = [dummy_end] * num_vehicles
 
         mgr = pywrapcp.RoutingIndexManager(n, num_vehicles, starts, ends)
         routing = pywrapcp.RoutingModel(mgr)
 
-        # Service durations aligned 1:1 with inspection_nodes
-        durations = [0] * n_real
-        for idx, ins in enumerate(inspection_nodes):
-            durations[idx] = ins.get('duration_minutes') or 45
+        # Service durations: homes=0, jobs=duration
+        durations = [0] * num_vehicles
+        for j, ins in enumerate(inspection_nodes):
+            durations.append(ins.get('duration_minutes') or 45)  # aligned with JOB_OFFSET + j
         durations.append(0)  # dummy
 
-        # Transit callback
+        # --------------------------
+        # Separate TIME vs COST cbs
+        # --------------------------
         def time_callback(from_idx, to_idx):
             from_node = mgr.IndexToNode(from_idx)
             to_node = mgr.IndexToNode(to_idx)
+            # Pure time for the Time dimension: travel + service at FROM node
             return matrix[from_node][to_node] + durations[from_node]
 
-        transit_callback_index = routing.RegisterTransitCallback(time_callback)
-        routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+        time_cb = routing.RegisterTransitCallback(time_callback)
 
-        # Time windows (soft overtime allowed on vehicle end)
+        AREA_JUMP_PENALTY = 8  # in "cost minutes" (tune: 5-15). Does NOT inflate time dimension.
+        def cost_callback(from_idx, to_idx):
+            from_node = mgr.IndexToNode(from_idx)
+            to_node = mgr.IndexToNode(to_idx)
+            base = matrix[from_node][to_node] + durations[from_node]
+            # add soft penalty when jumping between different grid buckets
+            if area_buckets[from_node] != area_buckets[to_node]:
+                return base + AREA_JUMP_PENALTY
+            return base
+
+        cost_cb = routing.RegisterTransitCallback(cost_callback)
+        routing.SetArcCostEvaluatorOfAllVehicles(cost_cb)
+
+        # -------------------
+        # Time dimension
+        # -------------------
         print("\nInspector availability windows:")
         time_windows: List[Tuple[int, int]] = []
         for insp in date_inspectors:
@@ -269,15 +339,15 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
         day_horizon = 24 * 60
         routing.AddDimension(
-            transit_callback_index,
-            0,                # no extra waiting slack
-            day_horizon,      # max cumul
+            time_cb,        # use the PURE time callback
+            0,              # no extra waiting slack
+            day_horizon,    # max cumul
             False,
             'Time'
         )
         time_dimension = routing.GetDimensionOrDie('Time')
 
-        # Allow soft overtime beyond end_min with per-minute penalty
+        # Allow soft overtime on the vehicle end
         OVERTIME_CAP_MIN = 240        # up to +4h if needed
         OVERTIME_COST_PER_MIN = 200   # overtime is expensive but cheaper than drop
 
@@ -292,7 +362,9 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             routing.AddVariableMinimizedByFinalizer(time_dimension.CumulVar(end_index))
             routing.AddVariableMinimizedByFinalizer(time_dimension.CumulVar(start_index))
 
-        # ---------- Optional load-balancing on service minutes ----------
+        # -------------
+        # Load balance (optional, unchanged)
+        # -------------
         def service_only_cb(from_idx, to_idx):
             from_node = mgr.IndexToNode(from_idx)
             return durations[from_node]  # only service duration, no travel
@@ -306,17 +378,18 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             "ServiceLoad"
         )
         svc_dim = routing.GetDimensionOrDie("ServiceLoad")
-        LOAD_CAP = 300          # ~5 hours of service
-        LOAD_PENALTY = 50       # tune up/down to push balancing
+        LOAD_CAP = 300
+        LOAD_PENALTY = 100   # a bit stronger to avoid 6-0 splits
         for v in range(num_vehicles):
             end_idx = routing.End(v)
             svc_dim.SetCumulVarSoftUpperBound(end_idx, LOAD_CAP, LOAD_PENALTY)
-        # ----------------------------------------------------------------
 
-        # Skill constraints (use node index directly)
+        # ------------------------
+        # Skill constraints on JOBS
+        # ------------------------
         print("\nApplying skill constraints...")
-        for idx, ins in enumerate(inspection_nodes):
-            node_index = mgr.NodeToIndex(idx)
+        for j, ins in enumerate(inspection_nodes):
+            node_index = mgr.NodeToIndex(JOB_OFFSET + j)
             allowed_vehicles: List[int] = []
             for vehicle_id, insp in enumerate(date_inspectors):
                 if ins['inspection_type'] in insp['can_do_types']:
@@ -328,32 +401,32 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             else:
                 print(f"  WARNING: No qualified inspector for {ins['inspection_type']}")
 
-        # BIG penalties for dropping any inspection node
+        # BIG penalties for dropping any JOB node (not home or dummy)
         BIG_DROP_PENALTY = 1_000_000
-        for node in range(n_real):
+        for node in range(JOB_OFFSET, JOB_OFFSET + n_jobs):
             routing.AddDisjunction([mgr.NodeToIndex(node)], BIG_DROP_PENALTY)
 
         # Solve with increased timeout
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
         search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
         search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-        search_parameters.time_limit.seconds = 300  # give it more time
+        search_parameters.time_limit.seconds = 300
 
-        print(f"\nSolving VRP with {num_vehicles} inspectors and {len(inspection_nodes)} nodes (1 per inspection)...")
+        print(f"\nSolving VRP with {num_vehicles} inspectors and {n_jobs} nodes (1 per inspection, home depots enabled)...")
         solution = routing.SolveWithParameters(search_parameters)
         if not solution:
             print("No complete solution found")
-            metrics['total_unscheduled'] += len(inspection_nodes)
+            metrics['total_unscheduled'] += n_jobs
             continue
 
         print("✓ Solution found!")
 
         # --- Dropped node diagnostics ---
         dropped = []
-        for node in range(n_real):
+        for node in range(JOB_OFFSET, JOB_OFFSET + n_jobs):
             node_index = mgr.NodeToIndex(node)
             if solution.Value(routing.NextVar(node_index)) == node_index:
-                dropped.append(inspection_nodes[node])
+                dropped.append(inspection_nodes[node - JOB_OFFSET])
 
         if dropped:
             print("\nDropped inspections (solver skipped despite penalty):")
@@ -380,12 +453,13 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             while not routing.IsEnd(index):
                 node = mgr.IndexToNode(index)
 
-                # Skip dummy depot
-                if node == dummy:
+                # Skip homes and dummy in printout; we only print jobs
+                if node < JOB_OFFSET or node == dummy_end:
                     index = solution.Value(routing.NextVar(index))
                     continue
 
-                ins = inspection_nodes[node]
+                # Job node
+                ins = inspection_nodes[node - JOB_OFFSET]
 
                 # Minutes from midnight
                 time_var = time_dimension.CumulVar(index)
@@ -397,15 +471,14 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 duration = ins.get('duration_minutes') or 45
                 end_dt = start_dt + timedelta(minutes=duration)
 
-                # Travel time between inspections (matrix minutes)
+                # Travel time between nodes (matrix minutes)
                 travel_time = 0
-                if route_sequence > 0 and prev_node is not None:
+                if prev_node is not None:
                     travel_time = matrix[prev_node][node]
 
                 route_sequence += 1
                 prev_node = node
 
-                # --- PRINT WITH ADDRESS ---
                 addr_str = ins.get('address') or '?'
                 print(f"  {insp['full_name']}: {ins['inspection_type']} @ {addr_str} at {start_dt.strftime('%H:%M')} (travel: {travel_time}min)")
 
