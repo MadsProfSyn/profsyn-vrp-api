@@ -30,6 +30,7 @@ def get_travel_time_from_cache(from_lat: float, from_lng: float,
     a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
     c = 2 * asin(sqrt(a))
     km = 6371 * c
+    # Assume 40 km/h average speed in Copenhagen
     minutes = (km / 40) * 60
     return max(5.0, minutes)
 
@@ -210,7 +211,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         matrix.append([0] * (n_real + 1))
         n = n_real + 1
 
-        # OR-Tools - all inspectors start/end at dummy depot (represents starting at first job)
+        # OR-Tools - all inspectors start/end at dummy depot
         num_vehicles = len(date_inspectors)
         starts = [dummy] * num_vehicles
         ends = [dummy] * num_vehicles
@@ -261,7 +262,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         for vehicle_id, (start_min, end_min) in enumerate(time_windows):
             start_index = routing.Start(vehicle_id)
             end_index = routing.End(vehicle_id)
-            # Inspectors can start their first job at start_min, finish last job by end_min
+            # Inspectors can start first job at start_min, finish last by end_min
             time_dimension.CumulVar(start_index).SetRange(start_min, start_min)
             time_dimension.CumulVar(end_index).SetRange(start_min, end_min)
 
@@ -282,6 +283,14 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 print(f"  {ins['inspection_type']} at {ins['address'][:30]}... → inspectors {allowed_vehicles}")
             else:
                 print(f"  WARNING: No qualified inspector for {ins['inspection_type']}")
+
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # Add penalties for dropped nodes (unscheduled inspections)
+        # New objective: Minimize(total_travel_time + 100000 × unscheduled_count)
+        for node in range(n_real):
+            if node != dummy and node not in starts:
+                routing.AddDisjunction([mgr.NodeToIndex(node)], 100000)
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         # Solve with increased timeout
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
@@ -334,7 +343,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 time_var = time_dimension.CumulVar(index)
                 time_min = solution.Value(time_var)
 
-                # For first inspection, start exactly at shift start (09:00)
+                # For first inspection, start exactly at shift start
                 if route_sequence == 0:
                     time_min = shift_start_min
 
@@ -416,3 +425,6 @@ if __name__ == "__main__":
     test_dates = ['2025-10-15']
     result = run_vrp_for_inspections(test_inspection_ids, test_dates)
     print(json.dumps(result, indent=2))
+    # Optionally persist:
+    # run_id = save_vrp_results(result['assignments'], result['metrics'])
+    # print("Saved VRP run:", run_id)
