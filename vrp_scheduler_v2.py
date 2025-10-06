@@ -31,15 +31,14 @@ def haversine_km(lat1, lng1, lat2, lng2) -> float:
 def fallback_minutes(lat1, lng1, lat2, lng2) -> float:
     """
     More realistic fallback:
-      - very short hops (<= 1 km): ~ 3–5 km/h walking/elevator/lobby friction -> ~12–20 min/km unrealistic for vehicle
-        but these are often same-building; keep a minimum of 5 min.
-      - city hops (<= 8 km): use ~ 22–28 km/h avg (signals/parking/etc) -> 25 km/h
-      - cross-town (8–20 km): ~ 35 km/h
-      - longer (20+ km): ~ 65 km/h (motorways)
+      - <=1 km: floor by min guard (5 min)
+      - <=8 km: ~25 km/h
+      - 8–20 km: ~35 km/h
+      - 20+ km: ~65 km/h
     """
     km = haversine_km(lat1, lng1, lat2, lng2)
     if km <= 1.0:
-        speed_kmh = 25.0  # keep vehicle-speed assumption; min guard below will enforce realistic floor
+        speed_kmh = 25.0
     elif km <= 8.0:
         speed_kmh = 25.0
     elif km <= 20.0:
@@ -57,7 +56,6 @@ def get_travel_time_from_cache(from_lat: float, from_lng: float,
     key = f"{from_lng},{from_lat}->{to_lng},{to_lat}"
     result = supabase.table('mapbox_travel_cache').select('minutes').eq('key', key).execute()
     if result.data and len(result.data) > 0 and result.data[0].get('minutes') is not None:
-        # Enforce a floor; cached times can be unrealistically low sometimes
         return max(5.0, float(result.data[0]['minutes']))
     # Fallback
     return fallback_minutes(from_lat, from_lng, to_lat, to_lng)
@@ -77,7 +75,7 @@ def build_distance_matrix(coords_list: List[Tuple[float, float]]) -> List[List[i
     return matrix
 
 def round_to_nearest_5_min(dt: datetime) -> datetime:
-    """Round datetime to nearest 5 minutes"""
+    """Round datetime to nearest 5 minutes (ceil to next 5)"""
     discard = timedelta(minutes=dt.minute % 5, seconds=dt.second, microseconds=dt.microsecond)
     dt += timedelta(minutes=5) - discard if discard else timedelta()
     return dt.replace(second=0, microsecond=0)
@@ -98,11 +96,14 @@ def area_bucket(lat: float, lng: float, granularity_deg: float = 0.01) -> Tuple[
 # ---------------------------------
 
 def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) -> Dict:
-    """Main VRP function adapted for new schema with:
-       - home depots (start & end)
-       - separate time and cost callbacks
-       - area-jump cost penalty
-       - more realistic fallback speeds
+    """
+    Main VRP function with:
+      - home depots (start & end at home)
+      - separate time vs. routing cost:
+          * Time dimension transit = travel + service(from)
+          * Routing objective cost  = travel-only (+ small area penalty)
+      - waiting slack allowed (so times don't all stick at start)
+      - stronger load balancing
     """
     print(f"Starting VRP for {len(inspection_ids)} inspections across {len(target_dates)} dates")
 
@@ -114,7 +115,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         .execute()
     inspections = inspections_result.data or []
 
-    # Get duration for each inspection
+    # Get duration for each inspection (from your existing tables)
     for ins in inspections:
         mapping_result = supabase.table('inspection_type_mappings') \
             .select('abbreviation') \
@@ -144,17 +145,17 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         if i['lat'] is not None and i['lng'] is not None
     ]
 
-    # Join with availability
+    # Join with availability (assumes one window per day per inspector)
     availability_result = supabase.table('supabase_availability') \
         .select('inspector_id, date_local, start_time_local, end_time_local') \
         .eq('is_available', True) \
         .in_('date_local', target_dates) \
         .execute()
 
-    # Create inspector availability map
     avail_map: Dict[Tuple[str, str], Dict[str, str]] = {}
     for avail in (availability_result.data or []):
         key = (avail['inspector_id'], str(avail['date_local']))
+        # If multiple rows exist for same day, last write wins (can extend later to multi-window)
         avail_map[key] = {
             'start_time_local': str(avail['start_time_local']),
             'end_time_local': str(avail['end_time_local'])
@@ -168,11 +169,9 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
     skills_map: Dict[str, List[str]] = {}
     for skill in (skills_result.data or []):
-        if skill['inspector_id'] not in skills_map:
-            skills_map[skill['inspector_id']] = []
-        skills_map[skill['inspector_id']].append(skill['inspection_type'])
+        skills_map.setdefault(skill['inspector_id'], []).append(skill['inspection_type'])
 
-    # Build inspectors array with availability and skills
+    # Build inspectors array with availability and skills (per date)
     inspectors: List[Dict] = []
     for insp in inspectors_data:
         for target_date in target_dates:
@@ -201,9 +200,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
     inspections_by_date: Dict[str, List[Dict]] = {}
     for ins in inspections:
         date = ins['preferred_date']
-        if date not in inspections_by_date:
-            inspections_by_date[date] = []
-        inspections_by_date[date].append(ins)
+        inspections_by_date.setdefault(date, []).append(ins)
 
     all_assignments: List[Dict] = []
     metrics = {
@@ -213,7 +210,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         'execution_seconds': 0
     }
 
-    # For printing detailed itineraries with addresses later
+    # For itineraries with addresses later
     address_by_id: Dict[str, str] = {ins['id']: ins.get('address') for ins in inspections}
 
     start_time = datetime.now()
@@ -278,18 +275,11 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         num_vehicles = len(date_inspectors)
         HOME_OFFSET = 0                      # homes: [0 .. num_vehicles-1]
         JOB_OFFSET = num_vehicles            # jobs:  [num_vehicles .. num_vehicles + n_jobs - 1]
-        n_real = num_vehicles + n_jobs
+        n = num_vehicles + n_jobs            # NO dummy end; we return to home
 
-        # Add dummy end to close routes if you prefer not to return to home
-        dummy_end = n_real
-        for row in matrix:
-            row.append(0)
-        matrix.append([0] * (n_real + 1))
-        n = n_real + 1
-
-        # OR-Tools starts/ends: start at each home, end at dummy (or set to home index to return-to-home)
+        # OR-Tools starts/ends: start and end at each home (return-to-home)
         starts = list(range(HOME_OFFSET, HOME_OFFSET + num_vehicles))
-        ends = [dummy_end] * num_vehicles
+        ends   = list(range(HOME_OFFSET, HOME_OFFSET + num_vehicles))
 
         mgr = pywrapcp.RoutingIndexManager(n, num_vehicles, starts, ends)
         routing = pywrapcp.RoutingModel(mgr)
@@ -297,32 +287,31 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         # Service durations: homes=0, jobs=duration
         durations = [0] * num_vehicles
         for j, ins in enumerate(inspection_nodes):
-            durations.append(ins.get('duration_minutes') or 45)  # aligned with JOB_OFFSET + j
-        durations.append(0)  # dummy
+            durations.append(ins.get('duration_minutes') or 45)
 
         # --------------------------
-        # Separate TIME vs COST cbs
+        # Separate TIME vs COST
         # --------------------------
+        # (A) Transit for TIME dimension = travel + service(at FROM node)
         def time_callback(from_idx, to_idx):
             from_node = mgr.IndexToNode(from_idx)
             to_node = mgr.IndexToNode(to_idx)
-            # Pure time for the Time dimension: travel + service at FROM node
             return matrix[from_node][to_node] + durations[from_node]
 
         time_cb = routing.RegisterTransitCallback(time_callback)
 
-        AREA_JUMP_PENALTY = 8  # in "cost minutes" (tune: 5-15). Does NOT inflate time dimension.
-        def cost_callback(from_idx, to_idx):
+        # (B) Routing COST = travel-only (+ small area penalty)
+        AREA_JUMP_PENALTY = 6  # minutes of "cost" (doesn't inflate time)
+        def travel_cost_callback(from_idx, to_idx):
             from_node = mgr.IndexToNode(from_idx)
             to_node = mgr.IndexToNode(to_idx)
-            base = matrix[from_node][to_node] + durations[from_node]
-            # add soft penalty when jumping between different grid buckets
+            base = matrix[from_node][to_node]
             if area_buckets[from_node] != area_buckets[to_node]:
                 return base + AREA_JUMP_PENALTY
             return base
 
-        cost_cb = routing.RegisterTransitCallback(cost_callback)
-        routing.SetArcCostEvaluatorOfAllVehicles(cost_cb)
+        travel_cost_cb = routing.RegisterTransitCallback(travel_cost_callback)
+        routing.SetArcCostEvaluatorOfAllVehicles(travel_cost_cb)
 
         # -------------------
         # Time dimension
@@ -337,33 +326,39 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             time_windows.append((start_min, end_min))
             print(f"  {insp['full_name']}: {insp['start_time_local']} - {insp['end_time_local']} ({start_min}-{end_min} min)")
 
+        # Allow waiting slack (so visits can start later than earliest feasible)
         day_horizon = 24 * 60
+        MAX_WAIT_PER_LEG = 240  # up to 4h wait allowed if needed for feasibility
         routing.AddDimension(
-            time_cb,        # use the PURE time callback
-            0,              # no extra waiting slack
-            day_horizon,    # max cumul
-            False,
+            time_cb,                 # travel + service(from)
+            MAX_WAIT_PER_LEG,        # waiting slack
+            day_horizon,             # max cumul
+            False,                   # do NOT force start at zero
             'Time'
         )
         time_dimension = routing.GetDimensionOrDie('Time')
 
-        # Allow soft overtime on the vehicle end
-        OVERTIME_CAP_MIN = 240        # up to +4h if needed
-        OVERTIME_COST_PER_MIN = 200   # overtime is expensive but cheaper than drop
+        # Overtime policy (softly discourage running past availability)
+        OVERTIME_CAP_MIN = 120        # allow up to +2h if absolutely needed
+        OVERTIME_COST_PER_MIN = 300   # expensive overtime
 
         for vehicle_id, (start_min, end_min) in enumerate(time_windows):
             start_index = routing.Start(vehicle_id)
             end_index   = routing.End(vehicle_id)
 
+            # Fix start at availability start
             time_dimension.CumulVar(start_index).SetRange(start_min, start_min)
+
+            # End can extend a bit with expensive overtime
             time_dimension.CumulVar(end_index).SetRange(start_min, end_min + OVERTIME_CAP_MIN)
             time_dimension.SetCumulVarSoftUpperBound(end_index, end_min, OVERTIME_COST_PER_MIN)
 
+            # Minimize starts/ends for tighter schedules
             routing.AddVariableMinimizedByFinalizer(time_dimension.CumulVar(end_index))
             routing.AddVariableMinimizedByFinalizer(time_dimension.CumulVar(start_index))
 
         # -------------
-        # Load balance (optional, unchanged)
+        # Load balance: penalize oversized daily service-load
         # -------------
         def service_only_cb(from_idx, to_idx):
             from_node = mgr.IndexToNode(from_idx)
@@ -378,8 +373,10 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             "ServiceLoad"
         )
         svc_dim = routing.GetDimensionOrDie("ServiceLoad")
-        LOAD_CAP = 300
-        LOAD_PENALTY = 100   # a bit stronger to avoid 6-0 splits
+
+        # Stronger balancing than before
+        LOAD_CAP = 240            # aim for ~4h service per inspector (tune)
+        LOAD_PENALTY = 600        # strong penalty to avoid 6-0 splits
         for v in range(num_vehicles):
             end_idx = routing.End(v)
             svc_dim.SetCumulVarSoftUpperBound(end_idx, LOAD_CAP, LOAD_PENALTY)
@@ -401,7 +398,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             else:
                 print(f"  WARNING: No qualified inspector for {ins['inspection_type']}")
 
-        # BIG penalties for dropping any JOB node (not home or dummy)
+        # BIG penalties for dropping any JOB node (not home)
         BIG_DROP_PENALTY = 1_000_000
         for node in range(JOB_OFFSET, JOB_OFFSET + n_jobs):
             routing.AddDisjunction([mgr.NodeToIndex(node)], BIG_DROP_PENALTY)
@@ -411,8 +408,10 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
         search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
         search_parameters.time_limit.seconds = 300
+        # Encourage route count usage (helps balance): activate some neighbors
+        search_parameters.use_full_propagation = True
 
-        print(f"\nSolving VRP with {num_vehicles} inspectors and {n_jobs} nodes (1 per inspection, home depots enabled)...")
+        print(f"\nSolving VRP with {num_vehicles} inspectors and {n_jobs} jobs (start/end at home)...")
         solution = routing.SolveWithParameters(search_parameters)
         if not solution:
             print("No complete solution found")
@@ -448,42 +447,51 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             insp = date_inspectors[vehicle_id]
             index = routing.Start(vehicle_id)
             route_sequence = 0
-            prev_node = None
+            prev_node = mgr.IndexToNode(index)  # start at home
+            prev_index = index
 
             while not routing.IsEnd(index):
+                index = solution.Value(routing.NextVar(index))
                 node = mgr.IndexToNode(index)
 
-                # Skip homes and dummy in printout; we only print jobs
-                if node < JOB_OFFSET or node == dummy_end:
-                    index = solution.Value(routing.NextVar(index))
+                # If we reached end (home), stop
+                if routing.IsEnd(index):
+                    # Add travel back-to-home minutes from last job (already in objective)
+                    travel_back = matrix[prev_node][starts[vehicle_id]]
+                    metrics['total_travel_minutes'] += travel_back
+                    break
+
+                # Skip homes in listing; we only print jobs
+                if node < JOB_OFFSET:
+                    prev_node = node
+                    prev_index = index
                     continue
 
                 # Job node
-                ins = inspection_nodes[node - JOB_OFFSET]
+                job = inspection_nodes[node - JOB_OFFSET]
 
-                # Minutes from midnight
+                # Minutes from midnight at ARRIVAL to this node (includes prior travel+service(from))
                 time_var = time_dimension.CumulVar(index)
                 time_min = solution.Value(time_var)
 
                 start_dt = day_midnight + timedelta(minutes=time_min)
                 start_dt = round_to_nearest_5_min(start_dt)
 
-                duration = ins.get('duration_minutes') or 45
+                duration = job.get('duration_minutes') or 45
                 end_dt = start_dt + timedelta(minutes=duration)
 
                 # Travel time between nodes (matrix minutes)
-                travel_time = 0
-                if prev_node is not None:
-                    travel_time = matrix[prev_node][node]
+                travel_time = matrix[prev_node][node] if prev_node is not None else 0
 
                 route_sequence += 1
                 prev_node = node
+                prev_index = index
 
-                addr_str = ins.get('address') or '?'
-                print(f"  {insp['full_name']}: {ins['inspection_type']} @ {addr_str} at {start_dt.strftime('%H:%M')} (travel: {travel_time}min)")
+                addr_str = job.get('address') or '?'
+                print(f"  {insp['full_name']}: {job['inspection_type']} @ {addr_str} at {start_dt.strftime('%H:%M')} (travel: {travel_time}min)")
 
                 all_assignments.append({
-                    'inspection_id': ins['id'],
+                    'inspection_id': job['id'],
                     'inspector_id': insp['inspector_id'],
                     'date': inspection_date,
                     'start_time': start_dt.time().isoformat(),
@@ -494,8 +502,6 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
                 metrics['total_scheduled'] += 1
                 metrics['total_travel_minutes'] += travel_time
-
-                index = solution.Value(routing.NextVar(index))
 
         # --- Assignment summary per inspector (for this date) ---
         per_insp = defaultdict(lambda: {"count": 0, "travel": 0})
@@ -563,6 +569,7 @@ def save_vrp_results(assignments, metrics):
     return run_id
 
 if __name__ == "__main__":
+    # Example run (replace with your real IDs/dates)
     test_inspection_ids = [
         'a34b89e0-0539-43ed-82dc-05593190a8ab',
         'd807c526-548f-4ab7-a27b-421d383cdd27'
