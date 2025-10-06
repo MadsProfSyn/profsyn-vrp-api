@@ -1,5 +1,6 @@
 import os
 import json
+from collections import defaultdict
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 from datetime import datetime, timedelta
@@ -179,6 +180,19 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             metrics['total_unscheduled'] += len(date_inspections)
             continue
 
+        # --- Capacity sanity check ---
+        total_capacity = 0
+        print("\nPer-inspector window lengths (minutes):")
+        for insp in date_inspectors:
+            st = datetime.strptime(insp['start_time_local'], '%H:%M:%S').time()
+            et = datetime.strptime(insp['end_time_local'], '%H:%M:%S').time()
+            cap = (et.hour*60 + et.minute) - (st.hour*60 + st.minute)
+            total_capacity += cap
+            print(f"  {insp['full_name']}: {cap} min")
+
+        total_demand = sum((ins.get('duration_minutes') or 45) for ins in date_inspections if ins.get('lat') and ins.get('lng'))
+        print(f"Capacity check for {inspection_date}: demand={total_demand} min, supply={total_capacity} min (not counting travel)")
+
         # Use inspection locations only (no inspector homes in routing)
         coords_inspections: List[Tuple[float, float]] = []
         valid_inspections: List[Dict] = []
@@ -192,6 +206,16 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         if not valid_inspections:
             continue
 
+        # --- Eligibility diagnostics ---
+        eligible_counts = defaultdict(int)
+        for ins in valid_inspections:
+            for insp in date_inspectors:
+                if ins['inspection_type'] in insp['can_do_types']:
+                    eligible_counts[insp['full_name']] += 1
+        print("\nEligible visit counts per inspector:")
+        for insp in date_inspectors:
+            print(f"  {insp['full_name']}: {eligible_counts.get(insp['full_name'], 0)} eligible")
+
         # Deduplicate coordinates
         unique_coords: List[Tuple[float, float]] = []
         coord_to_idx: Dict[Tuple[float, float], int] = {}
@@ -200,6 +224,10 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 coord_to_idx[c] = len(unique_coords)
                 unique_coords.append(c)
         n_real = len(unique_coords)
+
+        print(f"\nUnique coordinate nodes: {n_real} out of {len(valid_inspections)} valid inspections")
+        if n_real < len(valid_inspections):
+            print("WARNING: Multiple inspections share identical (lat,lng) and were deduplicated into one routing node.")
 
         print(f"Building travel matrix for {n_real} inspection locations...")
         matrix = build_distance_matrix(unique_coords)
@@ -252,7 +280,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         day_horizon = 24 * 60
         routing.AddDimension(
             transit_callback_index,
-            0,                # no waiting slack added (visits don't have windows)
+            0,                # no extra waiting slack; visits don't have windows
             day_horizon,      # max cumul
             False,
             'Time'
@@ -270,15 +298,37 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             # Hard start at shift start
             time_dimension.CumulVar(start_index).SetRange(start_min, start_min)
 
-            # Hard lower bound at shift start; upper bound allows overtime up to cap
+            # Allow overtime until end_min + cap
             time_dimension.CumulVar(end_index).SetRange(start_min, end_min + OVERTIME_CAP_MIN)
 
-            # Soft upper bound to penalize going past end_min
+            # Penalize going past end_min
             time_dimension.SetCumulVarSoftUpperBound(end_index, end_min, OVERTIME_COST_PER_MIN)
 
             # Help the solver tighten ends
             routing.AddVariableMinimizedByFinalizer(time_dimension.CumulVar(end_index))
             routing.AddVariableMinimizedByFinalizer(time_dimension.CumulVar(start_index))
+
+        # ---------- Optional load-balancing on service minutes ----------
+        # This discourages concentrating too many service minutes on one inspector
+        def service_only_cb(from_idx, to_idx):
+            from_node = mgr.IndexToNode(from_idx)
+            return durations[from_node]  # only service duration, no travel
+
+        svc_cb = routing.RegisterTransitCallback(service_only_cb)
+        routing.AddDimension(
+            svc_cb,
+            0,
+            24 * 60,   # generous cap
+            True,      # start at 0
+            "ServiceLoad"
+        )
+        svc_dim = routing.GetDimensionOrDie("ServiceLoad")
+        LOAD_CAP = 300          # ~5 hours of service
+        LOAD_PENALTY = 50       # tune up/down to push balancing
+        for v in range(num_vehicles):
+            end_idx = routing.End(v)
+            svc_dim.SetCumulVarSoftUpperBound(end_idx, LOAD_CAP, LOAD_PENALTY)
+        # ----------------------------------------------------------------
 
         # Skill constraints
         print("\nApplying skill constraints...")
@@ -300,7 +350,6 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 print(f"  WARNING: No qualified inspector for {ins['inspection_type']}")
 
         # BIG penalties for dropping any inspection node
-        # New objective ≈ Minimize( travel_time + 1_000_000 * dropped_count + overtime_cost )
         BIG_DROP_PENALTY = 1_000_000
         for node in range(n_real):
             if node != dummy and node not in starts:
@@ -320,6 +369,28 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             continue
 
         print("✓ Solution found!")
+
+        # --- Dropped node diagnostics ---
+        coord_to_ins = {(ins['lat'], ins['lng']): ins for ins in valid_inspections}
+        dropped = []
+        for node in range(n_real):
+            if node == dummy:
+                continue
+            node_index = mgr.NodeToIndex(node)
+            if solution.Value(routing.NextVar(node_index)) == node_index:
+                ins = coord_to_ins.get(unique_coords[node])
+                if ins:
+                    dropped.append(ins)
+
+        if dropped:
+            print("\nDropped inspections (solver skipped despite penalty):")
+            for ins in dropped:
+                eligible = []
+                for vid, insp in enumerate(date_inspectors):
+                    if ins['inspection_type'] in insp['can_do_types']:
+                        eligible.append(insp['full_name'])
+                reason = "NO QUALIFIED INSPECTOR" if not eligible else "LIKELY TIME CAPACITY / ROUTING"
+                print(f"  - {ins['inspection_type']} | rooms={ins.get('rooms')} | addr={ins.get('address','?')[:40]}... | eligible={len(eligible)} -> {reason}")
 
         # Extract solution
         tz = pytz.timezone('Europe/Copenhagen')
@@ -384,6 +455,18 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 print(f"  {insp['full_name']}: {matching_inspection['inspection_type']} at {start_dt.strftime('%H:%M')} (travel: {travel_time}min)")
 
                 index = solution.Value(routing.NextVar(index))
+
+        # --- Assignment summary per inspector (for this date) ---
+        per_insp = defaultdict(lambda: {"count": 0, "travel": 0})
+        for a in [a for a in all_assignments if a["date"] == inspection_date]:
+            per_insp[a["inspector_id"]]["count"] += 1
+            per_insp[a["inspector_id"]]["travel"] += a["travel_mins"]
+
+        id_to_name = {i["inspector_id"]: i["full_name"] for i in date_inspectors}
+        print("\nActual assignments per inspector (this date):")
+        for insp in date_inspectors:
+            pid = insp["inspector_id"]
+            print(f"  {id_to_name[pid]} → {per_insp[pid]['count']} visits (travel {per_insp[pid]['travel']} min)")
 
     metrics['execution_seconds'] = (datetime.now() - start_time).total_seconds()
     metrics['total_unscheduled'] = len(inspections) - metrics['total_scheduled']
