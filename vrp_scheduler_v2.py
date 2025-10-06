@@ -237,34 +237,48 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         transit_callback_index = routing.RegisterTransitCallback(time_callback)
         routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-        # Time windows
+        # Time windows (soft overtime allowed on vehicle end)
         print("\nInspector availability windows:")
         time_windows: List[Tuple[int, int]] = []
         for insp in date_inspectors:
-            start_time_obj = datetime.strptime(insp['start_time_local'], '%H:%M:%S').time()
-            end_time_obj = datetime.strptime(insp['end_time_local'], '%H:%M:%S').time()
-            start_min = start_time_obj.hour * 60 + start_time_obj.minute
-            end_min = end_time_obj.hour * 60 + end_time_obj.minute
+            st = datetime.strptime(insp['start_time_local'], '%H:%M:%S').time()
+            et = datetime.strptime(insp['end_time_local'], '%H:%M:%S').time()
+            start_min = st.hour * 60 + st.minute
+            end_min = et.hour * 60 + et.minute
             time_windows.append((start_min, end_min))
-            print(f"  {insp['full_name']}: {insp['start_time_local']} - {insp['end_time_local']} ({start_min}-{end_min} min from midnight)")
+            print(f"  {insp['full_name']}: {insp['start_time_local']} - {insp['end_time_local']} ({start_min}-{end_min} min)")
 
-        max_duration = max(end - start for start, end in time_windows)
-
+        # Large horizon so solver can use overtime when needed.
+        day_horizon = 24 * 60
         routing.AddDimension(
             transit_callback_index,
-            max_duration,
-            max_duration + 600,  # increased buffer
+            0,                # no waiting slack added (visits don't have windows)
+            day_horizon,      # max cumul
             False,
             'Time'
         )
         time_dimension = routing.GetDimensionOrDie('Time')
 
+        # Allow soft overtime beyond end_min with per-minute penalty
+        OVERTIME_CAP_MIN = 240        # allow up to +4h overtime if needed
+        OVERTIME_COST_PER_MIN = 200   # penalize overtime heavily but less than dropping
+
         for vehicle_id, (start_min, end_min) in enumerate(time_windows):
             start_index = routing.Start(vehicle_id)
-            end_index = routing.End(vehicle_id)
-            # Inspectors can start first job at start_min, finish last by end_min
+            end_index   = routing.End(vehicle_id)
+
+            # Hard start at shift start
             time_dimension.CumulVar(start_index).SetRange(start_min, start_min)
-            time_dimension.CumulVar(end_index).SetRange(start_min, end_min)
+
+            # Hard lower bound at shift start; upper bound allows overtime up to cap
+            time_dimension.CumulVar(end_index).SetRange(start_min, end_min + OVERTIME_CAP_MIN)
+
+            # Soft upper bound to penalize going past end_min
+            time_dimension.SetCumulVarSoftUpperBound(end_index, end_min, OVERTIME_COST_PER_MIN)
+
+            # Help the solver tighten ends
+            routing.AddVariableMinimizedByFinalizer(time_dimension.CumulVar(end_index))
+            routing.AddVariableMinimizedByFinalizer(time_dimension.CumulVar(start_index))
 
         # Skill constraints
         print("\nApplying skill constraints...")
@@ -282,21 +296,21 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 routing.SetAllowedVehiclesForIndex(allowed_vehicles, node_index)
                 print(f"  {ins['inspection_type']} at {ins['address'][:30]}... → inspectors {allowed_vehicles}")
             else:
+                # If truly no qualified inspector, the disjunction penalty will handle dropping as last resort
                 print(f"  WARNING: No qualified inspector for {ins['inspection_type']}")
 
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # Add penalties for dropped nodes (unscheduled inspections)
-        # New objective: Minimize(total_travel_time + 100000 × unscheduled_count)
+        # BIG penalties for dropping any inspection node
+        # New objective ≈ Minimize( travel_time + 1_000_000 * dropped_count + overtime_cost )
+        BIG_DROP_PENALTY = 1_000_000
         for node in range(n_real):
             if node != dummy and node not in starts:
-                routing.AddDisjunction([mgr.NodeToIndex(node)], 100000)
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+                routing.AddDisjunction([mgr.NodeToIndex(node)], BIG_DROP_PENALTY)
 
         # Solve with increased timeout
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
         search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
         search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-        search_parameters.time_limit.seconds = 120  # increased from 60
+        search_parameters.time_limit.seconds = 300  # give it more time
 
         print(f"\nSolving VRP with {num_vehicles} inspectors and {len(valid_inspections)} inspections...")
         solution = routing.SolveWithParameters(search_parameters)
@@ -314,9 +328,6 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
         for vehicle_id in range(num_vehicles):
             insp = date_inspectors[vehicle_id]
-            start_time_obj = datetime.strptime(insp['start_time_local'], '%H:%M:%S').time()
-            shift_start_min = start_time_obj.hour * 60 + start_time_obj.minute
-
             index = routing.Start(vehicle_id)
             route_sequence = 0
             prev_node = None
@@ -339,13 +350,9 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                     index = solution.Value(routing.NextVar(index))
                     continue
 
-                # Get timing from solution
+                # Minutes from midnight
                 time_var = time_dimension.CumulVar(index)
                 time_min = solution.Value(time_var)
-
-                # For first inspection, start exactly at shift start
-                if route_sequence == 0:
-                    time_min = shift_start_min
 
                 start_dt = day_midnight + timedelta(minutes=time_min)
                 start_dt = round_to_nearest_5_min(start_dt)
@@ -353,7 +360,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 duration = matching_inspection['duration_minutes'] or 45
                 end_dt = start_dt + timedelta(minutes=duration)
 
-                # Calculate travel time between inspections
+                # Travel time between inspections (matrix minutes)
                 travel_time = 0
                 if route_sequence > 0 and prev_node is not None:
                     travel_time = matrix[prev_node][node]
