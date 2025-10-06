@@ -193,44 +193,25 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         total_demand = sum((ins.get('duration_minutes') or 45) for ins in date_inspections if ins.get('lat') and ins.get('lng'))
         print(f"Capacity check for {inspection_date}: demand={total_demand} min, supply={total_capacity} min (not counting travel)")
 
-        # Use inspection locations only (no inspector homes in routing)
-        coords_inspections: List[Tuple[float, float]] = []
-        valid_inspections: List[Dict] = []
+        # Validate/geocode presence
+        inspection_nodes: List[Dict] = []
+        coords: List[Tuple[float, float]] = []
         for ins in date_inspections:
             if ins['lat'] and ins['lng']:
-                coords_inspections.append((ins['lat'], ins['lng']))
-                valid_inspections.append(ins)
+                inspection_nodes.append(ins)                  # keep each inspection as its own node
+                coords.append((ins['lat'], ins['lng']))       # 1:1 with nodes
             else:
                 print(f"Skipping inspection at {ins['address']} - missing coordinates")
                 metrics['total_unscheduled'] += 1
-        if not valid_inspections:
+
+        if not inspection_nodes:
             continue
 
-        # --- Eligibility diagnostics ---
-        eligible_counts = defaultdict(int)
-        for ins in valid_inspections:
-            for insp in date_inspectors:
-                if ins['inspection_type'] in insp['can_do_types']:
-                    eligible_counts[insp['full_name']] += 1
-        print("\nEligible visit counts per inspector:")
-        for insp in date_inspectors:
-            print(f"  {insp['full_name']}: {eligible_counts.get(insp['full_name'], 0)} eligible")
+        n_real = len(inspection_nodes)
+        print(f"\nNode count (no dedup): {n_real} (should equal number of valid inspections for this date)")
 
-        # Deduplicate coordinates
-        unique_coords: List[Tuple[float, float]] = []
-        coord_to_idx: Dict[Tuple[float, float], int] = {}
-        for c in coords_inspections:
-            if c not in coord_to_idx:
-                coord_to_idx[c] = len(unique_coords)
-                unique_coords.append(c)
-        n_real = len(unique_coords)
-
-        print(f"\nUnique coordinate nodes: {n_real} out of {len(valid_inspections)} valid inspections")
-        if n_real < len(valid_inspections):
-            print("WARNING: Multiple inspections share identical (lat,lng) and were deduplicated into one routing node.")
-
-        print(f"Building travel matrix for {n_real} inspection locations...")
-        matrix = build_distance_matrix(unique_coords)
+        print("Building travel matrix...")
+        matrix = build_distance_matrix(coords)
 
         # Add dummy depot (no actual location, just for OR-Tools structure)
         dummy = n_real
@@ -247,13 +228,10 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         mgr = pywrapcp.RoutingIndexManager(n, num_vehicles, starts, ends)
         routing = pywrapcp.RoutingModel(mgr)
 
-        # Service durations
+        # Service durations aligned 1:1 with inspection_nodes
         durations = [0] * n_real
-        for ins in valid_inspections:
-            coord = (ins['lat'], ins['lng'])
-            if coord in coord_to_idx:
-                idx = coord_to_idx[coord]
-                durations[idx] = ins['duration_minutes'] or 45
+        for idx, ins in enumerate(inspection_nodes):
+            durations[idx] = ins.get('duration_minutes') or 45
         durations.append(0)  # dummy
 
         # Transit callback
@@ -276,11 +254,10 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             time_windows.append((start_min, end_min))
             print(f"  {insp['full_name']}: {insp['start_time_local']} - {insp['end_time_local']} ({start_min}-{end_min} min)")
 
-        # Large horizon so solver can use overtime when needed.
         day_horizon = 24 * 60
         routing.AddDimension(
             transit_callback_index,
-            0,                # no extra waiting slack; visits don't have windows
+            0,                # no extra waiting slack
             day_horizon,      # max cumul
             False,
             'Time'
@@ -288,28 +265,21 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         time_dimension = routing.GetDimensionOrDie('Time')
 
         # Allow soft overtime beyond end_min with per-minute penalty
-        OVERTIME_CAP_MIN = 240        # allow up to +4h overtime if needed
-        OVERTIME_COST_PER_MIN = 200   # penalize overtime heavily but less than dropping
+        OVERTIME_CAP_MIN = 240        # up to +4h if needed
+        OVERTIME_COST_PER_MIN = 200   # overtime is expensive but cheaper than drop
 
         for vehicle_id, (start_min, end_min) in enumerate(time_windows):
             start_index = routing.Start(vehicle_id)
             end_index   = routing.End(vehicle_id)
 
-            # Hard start at shift start
             time_dimension.CumulVar(start_index).SetRange(start_min, start_min)
-
-            # Allow overtime until end_min + cap
             time_dimension.CumulVar(end_index).SetRange(start_min, end_min + OVERTIME_CAP_MIN)
-
-            # Penalize going past end_min
             time_dimension.SetCumulVarSoftUpperBound(end_index, end_min, OVERTIME_COST_PER_MIN)
 
-            # Help the solver tighten ends
             routing.AddVariableMinimizedByFinalizer(time_dimension.CumulVar(end_index))
             routing.AddVariableMinimizedByFinalizer(time_dimension.CumulVar(start_index))
 
         # ---------- Optional load-balancing on service minutes ----------
-        # This discourages concentrating too many service minutes on one inspector
         def service_only_cb(from_idx, to_idx):
             from_node = mgr.IndexToNode(from_idx)
             return durations[from_node]  # only service duration, no travel
@@ -318,7 +288,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         routing.AddDimension(
             svc_cb,
             0,
-            24 * 60,   # generous cap
+            24 * 60,
             True,      # start at 0
             "ServiceLoad"
         )
@@ -330,30 +300,25 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             svc_dim.SetCumulVarSoftUpperBound(end_idx, LOAD_CAP, LOAD_PENALTY)
         # ----------------------------------------------------------------
 
-        # Skill constraints
+        # Skill constraints (use node index directly)
         print("\nApplying skill constraints...")
-        for ins in valid_inspections:
-            coord = (ins['lat'], ins['lng'])
-            if coord not in coord_to_idx:
-                continue
-            node = coord_to_idx[coord]
-            node_index = mgr.NodeToIndex(node)
+        for idx, ins in enumerate(inspection_nodes):
+            node_index = mgr.NodeToIndex(idx)
             allowed_vehicles: List[int] = []
             for vehicle_id, insp in enumerate(date_inspectors):
                 if ins['inspection_type'] in insp['can_do_types']:
                     allowed_vehicles.append(vehicle_id)
             if allowed_vehicles:
                 routing.SetAllowedVehiclesForIndex(allowed_vehicles, node_index)
-                print(f"  {ins['inspection_type']} at {ins['address'][:30]}... → inspectors {allowed_vehicles}")
+                addr = (ins.get('address') or '')[:30]
+                print(f"  {ins['inspection_type']} at {addr}... → inspectors {allowed_vehicles}")
             else:
-                # If truly no qualified inspector, the disjunction penalty will handle dropping as last resort
                 print(f"  WARNING: No qualified inspector for {ins['inspection_type']}")
 
         # BIG penalties for dropping any inspection node
         BIG_DROP_PENALTY = 1_000_000
         for node in range(n_real):
-            if node != dummy and node not in starts:
-                routing.AddDisjunction([mgr.NodeToIndex(node)], BIG_DROP_PENALTY)
+            routing.AddDisjunction([mgr.NodeToIndex(node)], BIG_DROP_PENALTY)
 
         # Solve with increased timeout
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
@@ -361,26 +326,21 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
         search_parameters.time_limit.seconds = 300  # give it more time
 
-        print(f"\nSolving VRP with {num_vehicles} inspectors and {len(valid_inspections)} inspections...")
+        print(f"\nSolving VRP with {num_vehicles} inspectors and {len(inspection_nodes)} nodes (1 per inspection)...")
         solution = routing.SolveWithParameters(search_parameters)
         if not solution:
             print("No complete solution found")
-            metrics['total_unscheduled'] += len(valid_inspections)
+            metrics['total_unscheduled'] += len(inspection_nodes)
             continue
 
         print("✓ Solution found!")
 
         # --- Dropped node diagnostics ---
-        coord_to_ins = {(ins['lat'], ins['lng']): ins for ins in valid_inspections}
         dropped = []
         for node in range(n_real):
-            if node == dummy:
-                continue
             node_index = mgr.NodeToIndex(node)
             if solution.Value(routing.NextVar(node_index)) == node_index:
-                ins = coord_to_ins.get(unique_coords[node])
-                if ins:
-                    dropped.append(ins)
+                dropped.append(inspection_nodes[node])
 
         if dropped:
             print("\nDropped inspections (solver skipped despite penalty):")
@@ -390,7 +350,8 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                     if ins['inspection_type'] in insp['can_do_types']:
                         eligible.append(insp['full_name'])
                 reason = "NO QUALIFIED INSPECTOR" if not eligible else "LIKELY TIME CAPACITY / ROUTING"
-                print(f"  - {ins['inspection_type']} | rooms={ins.get('rooms')} | addr={ins.get('address','?')[:40]}... | eligible={len(eligible)} -> {reason}")
+                addr = (ins.get('address') or '')[:40]
+                print(f"  - {ins['inspection_type']} | rooms={ins.get('rooms')} | addr={addr}... | eligible={len(eligible)} -> {reason}")
 
         # Extract solution
         tz = pytz.timezone('Europe/Copenhagen')
@@ -411,15 +372,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                     index = solution.Value(routing.NextVar(index))
                     continue
 
-                node_coord = unique_coords[node]
-                matching_inspection = None
-                for ins in valid_inspections:
-                    if (ins['lat'], ins['lng']) == node_coord:
-                        matching_inspection = ins
-                        break
-                if not matching_inspection:
-                    index = solution.Value(routing.NextVar(index))
-                    continue
+                ins = inspection_nodes[node]
 
                 # Minutes from midnight
                 time_var = time_dimension.CumulVar(index)
@@ -428,7 +381,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 start_dt = day_midnight + timedelta(minutes=time_min)
                 start_dt = round_to_nearest_5_min(start_dt)
 
-                duration = matching_inspection['duration_minutes'] or 45
+                duration = ins.get('duration_minutes') or 45
                 end_dt = start_dt + timedelta(minutes=duration)
 
                 # Travel time between inspections (matrix minutes)
@@ -440,7 +393,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 prev_node = node
 
                 all_assignments.append({
-                    'inspection_id': matching_inspection['id'],
+                    'inspection_id': ins['id'],
                     'inspector_id': insp['inspector_id'],
                     'date': inspection_date,
                     'start_time': start_dt.time().isoformat(),
@@ -452,7 +405,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 metrics['total_scheduled'] += 1
                 metrics['total_travel_minutes'] += travel_time
 
-                print(f"  {insp['full_name']}: {matching_inspection['inspection_type']} at {start_dt.strftime('%H:%M')} (travel: {travel_time}min)")
+                print(f"  {insp['full_name']}: {ins['inspection_type']} at {start_dt.strftime('%H:%M')} (travel: {travel_time}min)")
 
                 index = solution.Value(routing.NextVar(index))
 
