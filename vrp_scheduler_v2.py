@@ -384,7 +384,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         'metrics': metrics
     }
 
-# After the return statement, add function to save results
+# Save results to database
 def save_vrp_results(assignments, metrics):
     """Save VRP assignments to proposed_assignments table"""
     import uuid
@@ -398,7 +398,9 @@ def save_vrp_results(assignments, metrics):
         'status': 'COMPLETED',
         'num_inspections_scheduled': metrics['total_scheduled'],
         'total_travel_minutes': metrics['total_travel_minutes'],
-        'execution_seconds': metrics['execution_seconds']
+        'execution_seconds': metrics['execution_seconds'],
+        'requested_by': 'api',   # added
+        'triggered_by': 'api'    # added
     }).execute()
     
     # Save proposed assignments
@@ -418,3 +420,6 @@ if __name__ == "__main__":
     test_dates = ['2025-10-15']
     result = run_vrp_for_inspections(test_inspection_ids, test_dates)
     print(json.dumps(result, indent=2))
+    # Example: save results
+    # run_id = save_vrp_results(result['assignments'], result['metrics'])
+    # print("Saved VRP run:", run_id)
