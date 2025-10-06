@@ -166,6 +166,9 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         'execution_seconds': 0
     }
 
+    # For printing detailed itineraries with addresses later
+    address_by_id: Dict[str, str] = {ins['id']: ins.get('address') for ins in inspections}
+
     start_time = datetime.now()
 
     # Process each date separately
@@ -193,7 +196,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         total_demand = sum((ins.get('duration_minutes') or 45) for ins in date_inspections if ins.get('lat') and ins.get('lng'))
         print(f"Capacity check for {inspection_date}: demand={total_demand} min, supply={total_capacity} min (not counting travel)")
 
-        # Validate/geocode presence
+        # Build per-inspection nodes (no dedup)
         inspection_nodes: List[Dict] = []
         coords: List[Tuple[float, float]] = []
         for ins in date_inspections:
@@ -209,6 +212,16 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
         n_real = len(inspection_nodes)
         print(f"\nNode count (no dedup): {n_real} (should equal number of valid inspections for this date)")
+
+        # --- Eligibility diagnostics ---
+        eligible_counts = defaultdict(int)
+        for ins in inspection_nodes:
+            for insp in date_inspectors:
+                if ins['inspection_type'] in insp['can_do_types']:
+                    eligible_counts[insp['full_name']] += 1
+        print("\nEligible visit counts per inspector:")
+        for insp in date_inspectors:
+            print(f"  {insp['full_name']}: {eligible_counts.get(insp['full_name'], 0)} eligible")
 
         print("Building travel matrix...")
         matrix = build_distance_matrix(coords)
@@ -392,6 +405,10 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 route_sequence += 1
                 prev_node = node
 
+                # --- PRINT WITH ADDRESS ---
+                addr_str = ins.get('address') or '?'
+                print(f"  {insp['full_name']}: {ins['inspection_type']} @ {addr_str} at {start_dt.strftime('%H:%M')} (travel: {travel_time}min)")
+
                 all_assignments.append({
                     'inspection_id': ins['id'],
                     'inspector_id': insp['inspector_id'],
@@ -404,8 +421,6 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
                 metrics['total_scheduled'] += 1
                 metrics['total_travel_minutes'] += travel_time
-
-                print(f"  {insp['full_name']}: {ins['inspection_type']} at {start_dt.strftime('%H:%M')} (travel: {travel_time}min)")
 
                 index = solution.Value(routing.NextVar(index))
 
@@ -420,6 +435,20 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         for insp in date_inspectors:
             pid = insp["inspector_id"]
             print(f"  {id_to_name[pid]} → {per_insp[pid]['count']} visits (travel {per_insp[pid]['travel']} min)")
+
+        # --- Detailed itineraries with addresses (this date) ---
+        print("\nDetailed itineraries (with addresses):")
+        for insp in date_inspectors:
+            pid = insp["inspector_id"]
+            person_jobs = [a for a in all_assignments if a["date"] == inspection_date and a["inspector_id"] == pid]
+            person_jobs.sort(key=lambda x: x["sequence"])
+            print(f"  {insp['full_name']}:")
+            if not person_jobs:
+                print("    (no assignments)")
+                continue
+            for a in person_jobs:
+                addr_str = address_by_id.get(a["inspection_id"], "?")
+                print(f"    #{a['sequence']:02d} {a['start_time']}–{a['end_time']} | {addr_str} (travel {a['travel_mins']}m)")
 
     metrics['execution_seconds'] = (datetime.now() - start_time).total_seconds()
     metrics['total_unscheduled'] = len(inspections) - metrics['total_scheduled']
