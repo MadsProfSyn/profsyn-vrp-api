@@ -398,6 +398,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         search = pywrapcp.DefaultRoutingSearchParameters()
         search.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
         search.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        search.time_limit.seconds = 600
         # You said you don't care if it runs long; leave no strict limit (or set high if your server imposes one)
         # search.time_limit.seconds = 600
         search.use_full_propagation = True
