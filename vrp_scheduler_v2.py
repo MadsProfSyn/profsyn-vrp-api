@@ -157,6 +157,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         .select('inspector_id, date_local, start_time_local, end_time_local') \
         .eq('is_available', True) \
         .in_('date_local', target_dates) \
+        .limit(150) \
         .execute()
 
     avail_map: Dict[Tuple[str, str], Dict[str, str]] = {}
