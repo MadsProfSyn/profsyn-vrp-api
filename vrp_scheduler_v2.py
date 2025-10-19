@@ -384,7 +384,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         # Search params
         search = pywrapcp.DefaultRoutingSearchParameters()
         search.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-        search.time_limit.seconds = 90
+        search.time_limit.seconds = 300
 
         print(f"\nSolving VRP with {num_vehicles} inspectors and {n_jobs} jobs (minimize km; start/end at home)...")
         solution = routing.SolveWithParameters(search)
