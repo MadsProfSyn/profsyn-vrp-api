@@ -157,7 +157,6 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         .select('inspector_id, date_local, start_time_local, end_time_local') \
         .eq('is_available', True) \
         .in_('date_local', target_dates) \
-        .limit(150) \
         .execute()
 
     avail_map: Dict[Tuple[str, str], Dict[str, str]] = {}
@@ -196,6 +195,35 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                     'can_do_types': skills_map.get(insp['id'], [])
                 })
 
+    # ============================================================================
+    # ✅ NEW: Load existing shifts to avoid conflicts
+    # ============================================================================
+    print("\nLoading existing shifts to avoid conflicts...")
+    shifts_result = supabase.table('supabase_shifts') \
+        .select('inspector_id, date_local, start_time_local, end_time_local, duration_minutes, status') \
+        .in_('date_local', target_dates) \
+        .in_('status', ['ASSIGNED', 'RELEASED']) \
+        .execute()
+
+    shifts_by_inspector_date: Dict[Tuple[str, str], List[Dict]] = {}
+    for shift in (shifts_result.data or []):
+        key = (shift['inspector_id'], str(shift['date_local']))
+        if key not in shifts_by_inspector_date:
+            shifts_by_inspector_date[key] = []
+        shifts_by_inspector_date[key].append(shift)
+
+    print(f"Loaded {len(shifts_result.data or [])} existing shifts across {len(shifts_by_inspector_date)} inspector-date combinations")
+
+    if shifts_result.data:
+        print("\nExisting shifts summary:")
+        for key, shifts in shifts_by_inspector_date.items():
+            inspector_id, date = key
+            insp_name = next((i['full_name'] for i in inspectors_data if i['id'] == inspector_id), 'Unknown')
+            total_shift_minutes = sum(s.get('duration_minutes', 0) for s in shifts)
+            shift_times = [f"{s['start_time_local'][:5]}-{s['end_time_local'][:5]}" for s in shifts]
+            print(f"  {insp_name} on {date}: {len(shifts)} shift(s) [{', '.join(shift_times)}], {total_shift_minutes} min total")
+    # ============================================================================
+
     if not inspections:
         return {"error": "No valid inspections to schedule"}
     if not inspectors:
@@ -232,18 +260,42 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             metrics['total_unscheduled'] += len(date_inspections)
             continue
 
-        # Capacity print
-        print("\nPer-inspector raw availability (minutes):")
+        # ============================================================================
+        # ✅ UPDATED: Capacity check accounting for existing shifts
+        # ============================================================================
+        print("\nPer-inspector availability (accounting for existing shifts):")
         total_capacity = 0
         for insp in date_inspectors:
             st = datetime.strptime(insp['start_time_local'], '%H:%M:%S').time()
             et = datetime.strptime(insp['end_time_local'], '%H:%M:%S').time()
-            cap = (et.hour*60 + et.minute) - (st.hour*60 + st.minute)
-            total_capacity += cap
-            print(f"  {insp['full_name']}: {cap} min")
+            start_min = st.hour*60 + st.minute
+            end_min = et.hour*60 + et.minute
+            
+            # Check for existing shifts
+            key = (insp['inspector_id'], insp['date_local'])
+            shift_minutes = 0
+            if key in shifts_by_inspector_date:
+                for shift in shifts_by_inspector_date[key]:
+                    shift_minutes += shift.get('duration_minutes', 0)
+            
+            # Available time = total window - shift time
+            raw_capacity = end_min - start_min
+            available_capacity = max(0, raw_capacity - shift_minutes)
+            
+            total_capacity += available_capacity
+            
+            if shift_minutes > 0:
+                print(f"  {insp['full_name']}: {raw_capacity} min total, {shift_minutes} min shifts, {available_capacity} min available")
+            else:
+                print(f"  {insp['full_name']}: {raw_capacity} min available")
 
         total_demand = sum((ins.get('duration_minutes') or 45) for ins in date_inspections if ins.get('lat') and ins.get('lng'))
-        print(f"Capacity check for {inspection_date}: demand={total_demand} min, supply={total_capacity} min (ignores travel & 09:00 rule)")
+        print(f"\nCapacity check for {inspection_date}:")
+        print(f"  Total demand (service only): {total_demand} min")
+        print(f"  Total available (after shifts): {total_capacity} min")
+        if total_capacity > 0:
+            print(f"  Utilization: {(total_demand / total_capacity * 100):.1f}%")
+        # ============================================================================
 
         # Build job nodes
         inspection_nodes: List[Dict] = []
@@ -344,22 +396,56 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         SOFT_END   = 17 * 60 + 15
         OVERTIME_COST_PER_MIN = 300
 
+        # ============================================================================
+        # ✅ UPDATED: Time windows adjusted for existing shifts
+        # ============================================================================
+        print("\nApplying time windows (adjusted for existing shifts):")
         for v, insp in enumerate(date_inspectors):
             start_index = routing.Start(v)
             end_index   = routing.End(v)
 
-            avail_start = to_minutes(datetime.strptime(insp['start_time_local'], '%H:%M:%S').time())
-            avail_end   = to_minutes(datetime.strptime(insp['end_time_local'], '%H:%M:%S').time())
+            # Get base availability window
+            st = datetime.strptime(insp['start_time_local'], '%H:%M:%S').time()
+            et = datetime.strptime(insp['end_time_local'], '%H:%M:%S').time()
+            start_min = st.hour * 60 + st.minute
+            end_min = et.hour * 60 + et.minute
+            original_start = start_min
 
+            # Check for existing shifts and adjust start time
+            key = (insp['inspector_id'], insp['date_local'])
+            if key in shifts_by_inspector_date:
+                inspector_shifts = shifts_by_inspector_date[key]
+                
+                # Find the latest shift end time
+                latest_shift_end_min = 0
+                for shift in inspector_shifts:
+                    shift_end = datetime.strptime(shift['end_time_local'], '%H:%M:%S').time()
+                    shift_end_min = shift_end.hour * 60 + shift_end.minute
+                    latest_shift_end_min = max(latest_shift_end_min, shift_end_min)
+                
+                # Adjust start time to after latest shift (with 15 min buffer)
+                if latest_shift_end_min > start_min:
+                    start_min = latest_shift_end_min + 15  # 15 min buffer
+                    print(f"  {insp['full_name']}: Adjusted start from {original_start//60:02d}:{original_start%60:02d} to {start_min//60:02d}:{start_min%60:02d} (after shifts ending at {latest_shift_end_min//60:02d}:{latest_shift_end_min%60:02d})")
+            
+            # Ensure start time doesn't exceed end time
+            if start_min >= end_min:
+                print(f"  WARNING: {insp['full_name']} has no available time after shifts")
+                start_min = end_min - 30  # Minimal window
+
+            # Enforce start min
+            avail_start = start_min
             start_min = max(HARD_START, avail_start if avail_start else HARD_START)
             time_dim.CumulVar(start_index).SetRange(start_min, start_min)
 
-            hard_end_cap = min(avail_end if avail_end else SOFT_END, SOFT_END)
+            # Soft end constraint
+            hard_end_cap = min(end_min if end_min else SOFT_END, SOFT_END)
             time_dim.CumulVar(end_index).SetRange(start_min, hard_end_cap)
             time_dim.SetCumulVarSoftUpperBound(end_index, HARD_END, OVERTIME_COST_PER_MIN)
 
             routing.AddVariableMinimizedByFinalizer(time_dim.CumulVar(end_index))
             routing.AddVariableMinimizedByFinalizer(time_dim.CumulVar(start_index))
+        # ============================================================================
 
         # Skill constraints
         print("\nApplying skill constraints...")
@@ -384,7 +470,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         # Search params
         search = pywrapcp.DefaultRoutingSearchParameters()
         search.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-        search.time_limit.seconds = 300
+        search.time_limit.seconds = 90
 
         print(f"\nSolving VRP with {num_vehicles} inspectors and {n_jobs} jobs (minimize km; start/end at home)...")
         solution = routing.SolveWithParameters(search)
@@ -407,7 +493,9 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 addr = (ins.get('address') or '')[:50]
                 print(f"  - {ins['inspection_type']} @ {addr}")
 
-        # Extract solution
+        # ============================================================================
+        # ✅ FIXED: Extract solution with corrected travel time attribution
+        # ============================================================================
         tz = pytz.timezone('Europe/Copenhagen')
         base_date = datetime.strptime(inspection_date, '%Y-%m-%d').date()
         day_midnight = tz.localize(datetime.combine(base_date, datetime.min.time()))
@@ -434,12 +522,27 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             if route_nodes and route_nodes[0] >= JOB_OFFSET:
                 total_km_deci += kmdeci_matrix[prev_node][route_nodes[0]]
 
-            # First job starts at 09:00
-            first_start_min = max(9 * 60, (datetime.strptime(insp['start_time_local'], '%H:%M:%S').time().hour * 60 +
-                                           datetime.strptime(insp['start_time_local'], '%H:%M:%S').time().minute))
+            # First job starts at adjusted time (after shifts if any)
+            st = datetime.strptime(insp['start_time_local'], '%H:%M:%S').time()
+            start_min = st.hour * 60 + st.minute
+            
+            # Adjust for shifts
+            key = (insp['inspector_id'], insp['date_local'])
+            if key in shifts_by_inspector_date:
+                latest_end = 0
+                for shift in shifts_by_inspector_date[key]:
+                    shift_end = datetime.strptime(shift['end_time_local'], '%H:%M:%S').time()
+                    shift_end_min = shift_end.hour * 60 + shift_end.minute
+                    latest_end = max(latest_end, shift_end_min)
+                if latest_end > start_min:
+                    start_min = latest_end + 15
+            
+            first_start_min = max(9 * 60, start_min)
             current_min = first_start_min
 
             sequence = 0
+            prev_node = starts[v]  # ✅ Initialize prev_node to home
+            
             # Iterate through jobs
             for node in route_nodes:
                 if node < JOB_OFFSET:
@@ -447,23 +550,31 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                     continue
 
                 job = inspection_nodes[node - JOB_OFFSET]
-                # Travel time from previous job (0 if from home)
-                travel_min = minutes_matrix[prev_node][node] if prev_node >= JOB_OFFSET else 0
                 
-                # IMPORTANT: Add minimum 5 min buffer even if same location
-                if travel_min == 0 and prev_node >= JOB_OFFSET:
-                    travel_min = 5
+                # ✅ FIXED: Calculate travel time FROM PREVIOUS location TO THIS location
+                if prev_node >= JOB_OFFSET:
+                    # Previous was a job
+                    travel_min_to_here = minutes_matrix[prev_node][node]
+                    if travel_min_to_here == 0:
+                        travel_min_to_here = 5  # Minimum buffer
+                else:
+                    # Previous was home
+                    travel_min_to_here = minutes_matrix[prev_node][node]
+                
+                # ✅ FIXED: Add travel time BEFORE starting this job
+                current_min += travel_min_to_here
 
                 # Schedule start (rounded to 5 min)
                 start_dt = day_midnight + timedelta(minutes=current_min)
                 start_dt = round_to_nearest_5_min(start_dt)
                 current_min = (start_dt - day_midnight).seconds // 60
 
+                # Service duration
                 duration = job.get('duration_minutes') or 45
                 end_minute = current_min + duration
 
-                # CRITICAL FIX: Move time forward by service duration + travel time to next
-                current_min = end_minute + travel_min
+                # ✅ FIXED: Move time forward by service duration ONLY
+                current_min = end_minute  # No travel added here!
 
                 sequence += 1
                 all_assignments.append({
@@ -473,15 +584,16 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                     'start_time': start_dt.time().isoformat(),
                     'end_time': (day_midnight + timedelta(minutes=end_minute)).time().isoformat(),
                     'sequence': sequence,
-                    'travel_mins': travel_min
+                    'travel_mins_from_previous': travel_min_to_here  # ✅ Clear name
                 })
 
-                print(f"  {name}: {job['inspection_type']} @ {job.get('address') or '?'} at {start_dt.strftime('%H:%M')} (service {duration}m, travel {travel_min}m)")
+                print(f"  {name}: Seq {sequence}: {job['inspection_type']} @ {job.get('address', '?')[:40]} | {start_dt.strftime('%H:%M')}-{(day_midnight + timedelta(minutes=end_minute)).strftime('%H:%M')} | travel from prev: {travel_min_to_here}m, service: {duration}m")
 
                 metrics['total_scheduled'] += 1
-                metrics['total_travel_minutes'] += travel_min
+                metrics['total_travel_minutes'] += travel_min_to_here
 
                 prev_node = node
+            # ============================================================================
 
             # Job->home travel (km only)
             last_job_node = prev_node
@@ -505,7 +617,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         per_insp = defaultdict(lambda: {"count": 0, "travel_min": 0})
         for a in [a for a in all_assignments if a["date"] == inspection_date]:
             per_insp[a["inspector_id"]]["count"] += 1
-            per_insp[a["inspector_id"]]["travel_min"] += a["travel_mins"]
+            per_insp[a["inspector_id"]]["travel_min"] += a["travel_mins_from_previous"]
 
         id_to_name = {i["inspector_id"]: i["full_name"] for i in date_inspectors}
         print("\nActual assignments per inspector (this date):")
@@ -525,7 +637,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             else:
                 for a in person_jobs:
                     addr_str = address_by_id.get(a["inspection_id"], "?")
-                    print(f"    #{a['sequence']:02d} {a['start_time']}–{a['end_time']} | {addr_str} (travel {a['travel_mins']}m)")
+                    print(f"    #{a['sequence']:02d} {a['start_time']}–{a['end_time']} | {addr_str} (travel {a['travel_mins_from_previous']}m)")
 
     metrics['execution_seconds'] = (datetime.now() - start_time).total_seconds()
     metrics['total_unscheduled'] = len(inspections) - metrics['total_scheduled']
