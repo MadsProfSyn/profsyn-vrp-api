@@ -196,32 +196,44 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 })
 
     # ============================================================================
-    # ✅ NEW: Load existing shifts to avoid conflicts
+    # ✅ NEW: Load inspector capacity (with existing shifts) to avoid conflicts
     # ============================================================================
-    print("\nLoading existing shifts to avoid conflicts...")
-    shifts_result = supabase.table('supabase_shifts') \
-        .select('inspector_id, date_local, start_time_local, end_time_local, duration_minutes, status') \
+    print("\nLoading inspector capacity view to avoid conflicts...")
+    
+    # Query the inspector_capacity_view for the target dates
+    capacity_result = supabase.table('inspector_capacity_view') \
+        .select('inspector_name, date_local, day_starts, day_ends, scheduled_shifts, booked_minutes, remaining_minutes, shift_types, capacity_status, percent_booked, shift_details') \
         .in_('date_local', target_dates) \
-        .in_('status', ['ASSIGNED', 'RELEASED']) \
+        .gt('scheduled_shifts', 0) \
         .execute()
 
+    # Build a mapping of (inspector_name, date) -> capacity data
+    capacity_by_inspector_date: Dict[Tuple[str, str], Dict] = {}
     shifts_by_inspector_date: Dict[Tuple[str, str], List[Dict]] = {}
-    for shift in (shifts_result.data or []):
-        key = (shift['inspector_id'], str(shift['date_local']))
-        if key not in shifts_by_inspector_date:
-            shifts_by_inspector_date[key] = []
-        shifts_by_inspector_date[key].append(shift)
+    
+    for capacity in (capacity_result.data or []):
+        # Create lookup by inspector name and date
+        key = (capacity['inspector_name'], str(capacity['date_local']))
+        capacity_by_inspector_date[key] = capacity
+        
+        # Extract shift details for later use
+        if capacity.get('shift_details'):
+            shifts_by_inspector_date[key] = capacity['shift_details']
 
-    print(f"Loaded {len(shifts_result.data or [])} existing shifts across {len(shifts_by_inspector_date)} inspector-date combinations")
+    print(f"Loaded capacity data for {len(capacity_by_inspector_date)} inspector-date combinations")
 
-    if shifts_result.data:
-        print("\nExisting shifts summary:")
-        for key, shifts in shifts_by_inspector_date.items():
-            inspector_id, date = key
-            insp_name = next((i['full_name'] for i in inspectors_data if i['id'] == inspector_id), 'Unknown')
-            total_shift_minutes = sum(s.get('duration_minutes', 0) for s in shifts)
-            shift_times = [f"{s['start_time_local'][:5]}-{s['end_time_local'][:5]}" for s in shifts]
-            print(f"  {insp_name} on {date}: {len(shifts)} shift(s) [{', '.join(shift_times)}], {total_shift_minutes} min total")
+    if capacity_result.data:
+        print("\nExisting shifts summary (from inspector_capacity_view):")
+        for capacity in capacity_result.data:
+            name = capacity['inspector_name']
+            date = capacity['date_local']
+            scheduled = capacity['scheduled_shifts']
+            booked = capacity['booked_minutes']
+            remaining = capacity['remaining_minutes']
+            status = capacity['capacity_status']
+            percent = capacity['percent_booked']
+            
+            print(f"  {name} on {date}: {scheduled} shift(s), {booked}m booked, {remaining}m remaining ({status}, {percent}% booked)")
     # ============================================================================
 
     if not inspections:
@@ -261,33 +273,32 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             continue
 
         # ============================================================================
-        # ✅ UPDATED: Capacity check accounting for existing shifts
+        # ✅ UPDATED: Capacity check using inspector_capacity_view data
         # ============================================================================
-        print("\nPer-inspector availability (accounting for existing shifts):")
+        print("\nPer-inspector availability (from capacity view):")
         total_capacity = 0
         for insp in date_inspectors:
-            st = datetime.strptime(insp['start_time_local'], '%H:%M:%S').time()
-            et = datetime.strptime(insp['end_time_local'], '%H:%M:%S').time()
-            start_min = st.hour*60 + st.minute
-            end_min = et.hour*60 + et.minute
+            # Look up capacity data by inspector name
+            key = (insp['full_name'], insp['date_local'])
             
-            # Check for existing shifts
-            key = (insp['inspector_id'], insp['date_local'])
-            shift_minutes = 0
-            if key in shifts_by_inspector_date:
-                for shift in shifts_by_inspector_date[key]:
-                    shift_minutes += shift.get('duration_minutes', 0)
-            
-            # Available time = total window - shift time
-            raw_capacity = end_min - start_min
-            available_capacity = max(0, raw_capacity - shift_minutes)
-            
-            total_capacity += available_capacity
-            
-            if shift_minutes > 0:
-                print(f"  {insp['full_name']}: {raw_capacity} min total, {shift_minutes} min shifts, {available_capacity} min available")
+            if key in capacity_by_inspector_date:
+                # Use data from capacity view
+                capacity_data = capacity_by_inspector_date[key]
+                available_capacity = capacity_data['remaining_minutes']
+                booked_minutes = capacity_data['booked_minutes']
+                capacity_status = capacity_data['capacity_status']
+                percent_booked = capacity_data['percent_booked']
+                
+                total_capacity += available_capacity
+                
+                print(f"  {insp['full_name']}: {booked_minutes}m booked, {available_capacity}m remaining ({capacity_status}, {percent_booked}% booked)")
             else:
-                print(f"  {insp['full_name']}: {raw_capacity} min available")
+                # No shifts, use full availability
+                st = datetime.strptime(insp['start_time_local'], '%H:%M:%S').time()
+                et = datetime.strptime(insp['end_time_local'], '%H:%M:%S').time()
+                raw_capacity = (et.hour*60 + et.minute) - (st.hour*60 + st.minute)
+                total_capacity += raw_capacity
+                print(f"  {insp['full_name']}: {raw_capacity}m available (no existing shifts)")
 
         total_demand = sum((ins.get('duration_minutes') or 45) for ins in date_inspections if ins.get('lat') and ins.get('lng'))
         print(f"\nCapacity check for {inspection_date}:")
@@ -411,15 +422,15 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             end_min = et.hour * 60 + et.minute
             original_start = start_min
 
-            # Check for existing shifts and adjust start time
-            key = (insp['inspector_id'], insp['date_local'])
+            # Check for existing shifts and adjust start time using capacity view
+            key = (insp['full_name'], insp['date_local'])
             if key in shifts_by_inspector_date:
                 inspector_shifts = shifts_by_inspector_date[key]
                 
                 # Find the latest shift end time
                 latest_shift_end_min = 0
                 for shift in inspector_shifts:
-                    shift_end = datetime.strptime(shift['end_time_local'], '%H:%M:%S').time()
+                    shift_end = datetime.strptime(shift['end_time'], '%H:%M:%S').time()
                     shift_end_min = shift_end.hour * 60 + shift_end.minute
                     latest_shift_end_min = max(latest_shift_end_min, shift_end_min)
                 
