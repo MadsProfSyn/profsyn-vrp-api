@@ -1,33 +1,8 @@
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
-ortools==9.8.3296
-python-dotenv==1.0.0
-pytz==2024.1
-pydantic==2.5.3
-supabase==2.7.4
-gotrue==2.4.4
-httpx==0.27.2
-
-# VRP Scheduler Requirements with Job Queue
-# Updated to include Flask for job queue API
-
-# Web Framework - Flask (for job queue API)
 flask==3.0.0
 flask-cors==4.0.0
-
-# VRP Optimization
 ortools==9.8.3296
-
-# Database
-supabase==2.7.4
-gotrue==2.4.4
-
-# Utilities
 python-dotenv==1.0.0
 pytz==2024.1
+supabase==2.7.4
+gotrue==2.4.4
 httpx==0.27.2
-
-# Optional: Keep FastAPI if you want both (doesn't hurt)
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
-pydantic==2.5.3
