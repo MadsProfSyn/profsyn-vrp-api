@@ -4,17 +4,264 @@ from collections import defaultdict
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 from datetime import datetime, timedelta
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 import math
 import pytz
 from supabase import create_client, Client
 from dotenv import load_dotenv
+import uuid
+import traceback
 
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ============================================================================
+# JOB QUEUE MANAGEMENT - Prevents concurrent VRP executions
+# ============================================================================
+
+class JobQueue:
+    """Manages VRP job queue to prevent concurrent executions"""
+    
+    def __init__(self, supabase_client: Client):
+        self.supabase = supabase_client
+    
+    def can_start_job(self, job_type: str = "vrp_calculation") -> bool:
+        """Check if a job can start (no other job running)"""
+        try:
+            result = self.supabase.table('job_queue').select('*')\
+                .eq('job_type', job_type)\
+                .eq('status', 'running')\
+                .execute()
+            
+            return len(result.data) == 0
+        except Exception as e:
+            print(f"Error checking job queue: {e}")
+            return False
+    
+    def create_job(self, job_type: str = "vrp_calculation", params: Optional[Dict] = None) -> Optional[str]:
+        """Create a new job in pending state"""
+        try:
+            job = {
+                'id': str(uuid.uuid4()),
+                'job_type': job_type,
+                'status': 'pending',
+                'created_at': datetime.utcnow().isoformat(),
+                'params': params or {}
+            }
+            result = self.supabase.table('job_queue').insert(job).execute()
+            return result.data[0]['id']
+        except Exception as e:
+            print(f"Error creating job: {e}")
+            return None
+    
+    def start_job(self, job_id: str) -> bool:
+        """Mark job as running"""
+        try:
+            self.supabase.table('job_queue').update({
+                'status': 'running',
+                'started_at': datetime.utcnow().isoformat()
+            }).eq('id', job_id).execute()
+            return True
+        except Exception as e:
+            print(f"Error starting job {job_id}: {e}")
+            return False
+    
+    def complete_job(self, job_id: str, result_data: Optional[Dict] = None) -> bool:
+        """Mark job as completed with results"""
+        try:
+            self.supabase.table('job_queue').update({
+                'status': 'completed',
+                'completed_at': datetime.utcnow().isoformat(),
+                'result': result_data or {}
+            }).eq('id', job_id).execute()
+            return True
+        except Exception as e:
+            print(f"Error completing job {job_id}: {e}")
+            return False
+    
+    def fail_job(self, job_id: str, error_message: str) -> bool:
+        """Mark job as failed with error message"""
+        try:
+            self.supabase.table('job_queue').update({
+                'status': 'failed',
+                'completed_at': datetime.utcnow().isoformat(),
+                'error': error_message
+            }).eq('id', job_id).execute()
+            return True
+        except Exception as e:
+            print(f"Error failing job {job_id}: {e}")
+            return False
+    
+    def get_job_status(self, job_id: str) -> Optional[Dict]:
+        """Get current job status"""
+        try:
+            result = self.supabase.table('job_queue').select('*')\
+                .eq('id', job_id)\
+                .execute()
+            
+            if result.data and len(result.data) > 0:
+                return result.data[0]
+            return None
+        except Exception as e:
+            print(f"Error getting job status {job_id}: {e}")
+            return None
+    
+    def cleanup_stale_jobs(self, hours: int = 24) -> int:
+        """Clean up old completed/failed jobs"""
+        try:
+            cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+            result = self.supabase.table('job_queue').delete()\
+                .in_('status', ['completed', 'failed'])\
+                .lt('completed_at', cutoff)\
+                .execute()
+            
+            return len(result.data) if result.data else 0
+        except Exception as e:
+            print(f"Error cleaning up jobs: {e}")
+            return 0
+
+# Initialize job queue manager
+job_queue = JobQueue(supabase)
+
+# ============================================================================
+# MAIN VRP EXECUTION WRAPPER - Entry point with job management
+# ============================================================================
+
+def schedule_inspections_with_queue(inspection_ids: List[str], target_dates: List[str], 
+                                   requested_by: str = 'api') -> Dict:
+    """
+    Main entry point for scheduling inspections with job queue management.
+    This prevents concurrent executions and provides status tracking.
+    
+    Args:
+        inspection_ids: List of inspection IDs to schedule
+        target_dates: List of target dates for scheduling
+        requested_by: Who requested this job (for tracking)
+    
+    Returns:
+        Dict with job_id and initial status, or error if job cannot start
+    """
+    
+    # Check if another job is running
+    if not job_queue.can_start_job():
+        return {
+            'error': 'Another VRP calculation is currently running. Please wait and try again.',
+            'status': 'blocked'
+        }
+    
+    # Create job
+    job_id = job_queue.create_job(
+        job_type='vrp_calculation',
+        params={
+            'inspection_ids': inspection_ids,
+            'target_dates': target_dates,
+            'requested_by': requested_by
+        }
+    )
+    
+    if not job_id:
+        return {
+            'error': 'Failed to create job in queue',
+            'status': 'error'
+        }
+    
+    print(f"\n{'='*60}")
+    print(f"🚀 Starting VRP Job: {job_id}")
+    print(f"{'='*60}")
+    
+    try:
+        # Start the job
+        if not job_queue.start_job(job_id):
+            return {
+                'error': 'Failed to start job',
+                'status': 'error',
+                'job_id': job_id
+            }
+        
+        # Run the actual VRP calculation
+        result = run_vrp_for_inspections(inspection_ids, target_dates)
+        
+        # Check if there was an error in VRP execution
+        if 'error' in result:
+            job_queue.fail_job(job_id, result['error'])
+            return {
+                'error': result['error'],
+                'status': 'failed',
+                'job_id': job_id
+            }
+        
+        # Save results to database
+        run_id = save_vrp_results(result['assignments'], result['metrics'])
+        
+        # Complete the job with results summary
+        job_queue.complete_job(job_id, {
+            'vrp_run_id': run_id,
+            'total_scheduled': result['metrics']['total_scheduled'],
+            'total_unscheduled': result['metrics']['total_unscheduled'],
+            'total_travel_minutes': result['metrics']['total_travel_minutes'],
+            'total_travel_km': result['metrics'].get('total_travel_km', 0),
+            'execution_seconds': result['metrics']['execution_seconds']
+        })
+        
+        print(f"\n✅ VRP Job Completed: {job_id}")
+        print(f"{'='*60}\n")
+        
+        return {
+            'status': 'completed',
+            'job_id': job_id,
+            'vrp_run_id': run_id,
+            'summary': {
+                'total_scheduled': result['metrics']['total_scheduled'],
+                'total_unscheduled': result['metrics']['total_unscheduled'],
+                'total_travel_minutes': result['metrics']['total_travel_minutes'],
+                'total_travel_km': result['metrics'].get('total_travel_km', 0),
+                'execution_seconds': result['metrics']['execution_seconds']
+            }
+        }
+        
+    except Exception as e:
+        error_msg = f"{str(e)}\n{traceback.format_exc()}"
+        print(f"\n❌ VRP Job Failed: {job_id}")
+        print(f"Error: {error_msg}")
+        print(f"{'='*60}\n")
+        
+        job_queue.fail_job(job_id, error_msg)
+        
+        return {
+            'error': str(e),
+            'status': 'failed',
+            'job_id': job_id
+        }
+
+# ============================================================================
+# API ENDPOINT FUNCTIONS - For Railway deployment
+# ============================================================================
+
+def get_job_status_api(job_id: str) -> Dict:
+    """
+    API endpoint to check job status.
+    Call this from your React app to poll for job completion.
+    """
+    status = job_queue.get_job_status(job_id)
+    
+    if not status:
+        return {
+            'error': 'Job not found',
+            'job_id': job_id
+        }
+    
+    return {
+        'job_id': job_id,
+        'status': status['status'],
+        'created_at': status.get('created_at'),
+        'started_at': status.get('started_at'),
+        'completed_at': status.get('completed_at'),
+        'result': status.get('result'),
+        'error': status.get('error')
+    }
 
 # ----------------------------
 # Helpers for travel estimates
@@ -195,28 +442,22 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                     'can_do_types': skills_map.get(insp['id'], [])
                 })
 
-    # ============================================================================
-    # ✅ NEW: Load inspector capacity (with existing shifts) to avoid conflicts
-    # ============================================================================
+    # Load inspector capacity (with existing shifts) to avoid conflicts
     print("\nLoading inspector capacity view to avoid conflicts...")
     
-    # Query the inspector_capacity_view for the target dates
     capacity_result = supabase.table('inspector_capacity_view') \
         .select('inspector_name, date_local, day_starts, day_ends, scheduled_shifts, booked_minutes, remaining_minutes, shift_types, capacity_status, percent_booked, shift_details') \
         .in_('date_local', target_dates) \
         .gt('scheduled_shifts', 0) \
         .execute()
 
-    # Build a mapping of (inspector_name, date) -> capacity data
     capacity_by_inspector_date: Dict[Tuple[str, str], Dict] = {}
     shifts_by_inspector_date: Dict[Tuple[str, str], List[Dict]] = {}
     
     for capacity in (capacity_result.data or []):
-        # Create lookup by inspector name and date
         key = (capacity['inspector_name'], str(capacity['date_local']))
         capacity_by_inspector_date[key] = capacity
         
-        # Extract shift details for later use
         if capacity.get('shift_details'):
             shifts_by_inspector_date[key] = capacity['shift_details']
 
@@ -234,7 +475,6 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             percent = capacity['percent_booked']
             
             print(f"  {name} on {date}: {scheduled} shift(s), {booked}m booked, {remaining}m remaining ({status}, {percent}% booked)")
-    # ============================================================================
 
     if not inspections:
         return {"error": "No valid inspections to schedule"}
@@ -272,17 +512,12 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             metrics['total_unscheduled'] += len(date_inspections)
             continue
 
-        # ============================================================================
-        # ✅ UPDATED: Capacity check using inspector_capacity_view data
-        # ============================================================================
         print("\nPer-inspector availability (from capacity view):")
         total_capacity = 0
         for insp in date_inspectors:
-            # Look up capacity data by inspector name
             key = (insp['full_name'], insp['date_local'])
             
             if key in capacity_by_inspector_date:
-                # Use data from capacity view
                 capacity_data = capacity_by_inspector_date[key]
                 available_capacity = capacity_data['remaining_minutes']
                 booked_minutes = capacity_data['booked_minutes']
@@ -293,7 +528,6 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 
                 print(f"  {insp['full_name']}: {booked_minutes}m booked, {available_capacity}m remaining ({capacity_status}, {percent_booked}% booked)")
             else:
-                # No shifts, use full availability
                 st = datetime.strptime(insp['start_time_local'], '%H:%M:%S').time()
                 et = datetime.strptime(insp['end_time_local'], '%H:%M:%S').time()
                 raw_capacity = (et.hour*60 + et.minute) - (st.hour*60 + st.minute)
@@ -306,7 +540,6 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         print(f"  Total available (after shifts): {total_capacity} min")
         if total_capacity > 0:
             print(f"  Utilization: {(total_demand / total_capacity * 100):.1f}%")
-        # ============================================================================
 
         # Build job nodes
         inspection_nodes: List[Dict] = []
@@ -407,9 +640,6 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         SOFT_END   = 17 * 60 + 15
         OVERTIME_COST_PER_MIN = 300
 
-        # ============================================================================
-        # ✅ UPDATED: Time windows adjusted for existing shifts
-        # ============================================================================
         print("\nApplying time windows (adjusted for existing shifts):")
         for v, insp in enumerate(date_inspectors):
             start_index = routing.Start(v)
@@ -456,7 +686,6 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
             routing.AddVariableMinimizedByFinalizer(time_dim.CumulVar(end_index))
             routing.AddVariableMinimizedByFinalizer(time_dim.CumulVar(start_index))
-        # ============================================================================
 
         # Skill constraints
         print("\nApplying skill constraints...")
@@ -504,9 +733,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 addr = (ins.get('address') or '')[:50]
                 print(f"  - {ins['inspection_type']} @ {addr}")
 
-        # ============================================================================
-        # ✅ FIXED: Extract solution with corrected travel time attribution
-        # ============================================================================
+        # Extract solution with corrected travel time attribution
         tz = pytz.timezone('Europe/Copenhagen')
         base_date = datetime.strptime(inspection_date, '%Y-%m-%d').date()
         day_midnight = tz.localize(datetime.combine(base_date, datetime.min.time()))
@@ -552,7 +779,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             current_min = first_start_min
 
             sequence = 0
-            prev_node = starts[v]  # ✅ Initialize prev_node to home
+            prev_node = starts[v]  # Initialize prev_node to home
             
             # Iterate through jobs
             for node in route_nodes:
@@ -562,7 +789,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
                 job = inspection_nodes[node - JOB_OFFSET]
                 
-                # ✅ FIXED: Calculate travel time FROM PREVIOUS location TO THIS location
+                # Calculate travel time FROM PREVIOUS location TO THIS location
                 if prev_node >= JOB_OFFSET:
                     # Previous was a job
                     travel_min_to_here = minutes_matrix[prev_node][node]
@@ -572,7 +799,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                     # Previous was home
                     travel_min_to_here = minutes_matrix[prev_node][node]
                 
-                # ✅ FIXED: Add travel time BEFORE starting this job
+                # Add travel time BEFORE starting this job
                 current_min += travel_min_to_here
 
                 # Schedule start (rounded to 5 min)
@@ -584,8 +811,8 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 duration = job.get('duration_minutes') or 45
                 end_minute = current_min + duration
 
-                # ✅ FIXED: Move time forward by service duration ONLY
-                current_min = end_minute  # No travel added here!
+                # Move time forward by service duration ONLY
+                current_min = end_minute
 
                 sequence += 1
                 all_assignments.append({
@@ -595,7 +822,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                     'start_time': start_dt.time().isoformat(),
                     'end_time': (day_midnight + timedelta(minutes=end_minute)).time().isoformat(),
                     'sequence': sequence,
-                    'travel_mins_from_previous': travel_min_to_here  # ✅ Clear name
+                    'travel_mins_from_previous': travel_min_to_here
                 })
 
                 print(f"  {name}: Seq {sequence}: {job['inspection_type']} @ {job.get('address', '?')[:40]} | {start_dt.strftime('%H:%M')}-{(day_midnight + timedelta(minutes=end_minute)).strftime('%H:%M')} | travel from prev: {travel_min_to_here}m, service: {duration}m")
@@ -604,7 +831,6 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 metrics['total_travel_minutes'] += travel_min_to_here
 
                 prev_node = node
-            # ============================================================================
 
             # Job->home travel (km only)
             last_job_node = prev_node
@@ -667,7 +893,6 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
 def save_vrp_results(assignments, metrics):
     """Save VRP assignments to proposed_assignments table"""
-    import uuid
     run_id = str(uuid.uuid4())
 
     supabase.table('vrp_runs').insert({
@@ -692,10 +917,13 @@ def save_vrp_results(assignments, metrics):
     return run_id
 
 if __name__ == "__main__":
+    # Test with job queue management
     test_inspection_ids = [
         'a34b89e0-0539-43ed-82dc-05593190a8ab',
         'd807c526-548f-4ab7-a27b-421d383cdd27'
     ]
     test_dates = ['2025-10-15']
-    result = run_vrp_for_inspections(test_inspection_ids, test_dates)
+    
+    # Use the new queue-managed function
+    result = schedule_inspections_with_queue(test_inspection_ids, test_dates, requested_by='test')
     print(json.dumps(result, indent=2))
