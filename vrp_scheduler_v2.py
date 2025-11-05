@@ -445,8 +445,9 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
     # Load inspector capacity (with existing shifts) to avoid conflicts
     print("\nLoading inspector capacity view to avoid conflicts...")
     
+    # Note: View has start_time_local/end_time_local, not day_starts/day_ends
     capacity_result = supabase.table('inspector_capacity_view') \
-        .select('inspector_name, date_local, day_starts, day_ends, scheduled_shifts, booked_minutes, remaining_minutes, shift_types, capacity_status, percent_booked, shift_details') \
+        .select('inspector_id, inspector_name, date_local, start_time_local, end_time_local, scheduled_shifts, booked_minutes, remaining_minutes, shift_types, capacity_status, percent_booked, shift_details') \
         .in_('date_local', target_dates) \
         .gt('scheduled_shifts', 0) \
         .execute()
@@ -456,7 +457,21 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
     
     for capacity in (capacity_result.data or []):
         key = (capacity['inspector_name'], str(capacity['date_local']))
-        capacity_by_inspector_date[key] = capacity
+        # Map database columns to expected internal format
+        capacity_by_inspector_date[key] = {
+            'inspector_id': capacity['inspector_id'],
+            'inspector_name': capacity['inspector_name'],
+            'date_local': capacity['date_local'],
+            'day_starts': capacity['start_time_local'],  # Map column name
+            'day_ends': capacity['end_time_local'],      # Map column name
+            'scheduled_shifts': capacity['scheduled_shifts'],
+            'booked_minutes': capacity['booked_minutes'],
+            'remaining_minutes': capacity['remaining_minutes'],
+            'shift_types': capacity['shift_types'],
+            'capacity_status': capacity['capacity_status'],
+            'percent_booked': capacity['percent_booked'],
+            'shift_details': capacity['shift_details']
+        }
         
         if capacity.get('shift_details'):
             shifts_by_inspector_date[key] = capacity['shift_details']
