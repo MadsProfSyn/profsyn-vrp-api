@@ -833,11 +833,11 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 all_assignments.append({
                     'inspection_id': job['id'],
                     'inspector_id': insp['inspector_id'],
-                    'date': inspection_date,
+                    'scheduled_date': inspection_date,
                     'start_time': start_dt.time().isoformat(),
                     'end_time': (day_midnight + timedelta(minutes=end_minute)).time().isoformat(),
-                    'sequence': sequence,
-                    'travel_mins_from_previous': travel_min_to_here
+                    'sequence_in_route': sequence,
+                    'travel_from_previous_mins': travel_min_to_here
                 })
 
                 print(f"  {name}: Seq {sequence}: {job['inspection_type']} @ {job.get('address', '?')[:40]} | {start_dt.strftime('%H:%M')}-{(day_midnight + timedelta(minutes=end_minute)).strftime('%H:%M')} | travel from prev: {travel_min_to_here}m, service: {duration}m")
@@ -867,9 +867,9 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
         # Per-inspector summary
         per_insp = defaultdict(lambda: {"count": 0, "travel_min": 0})
-        for a in [a for a in all_assignments if a["date"] == inspection_date]:
+        for a in [a for a in all_assignments if a["scheduled_date"] == inspection_date]:
             per_insp[a["inspector_id"]]["count"] += 1
-            per_insp[a["inspector_id"]]["travel_min"] += a["travel_mins_from_previous"]
+            per_insp[a["inspector_id"]]["travel_min"] += a["travel_from_previous_mins"]
 
         id_to_name = {i["inspector_id"]: i["full_name"] for i in date_inspectors}
         print("\nActual assignments per inspector (this date):")
@@ -881,15 +881,15 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         print("\nDetailed itineraries (with addresses):")
         for insp in date_inspectors:
             pid = insp["inspector_id"]
-            person_jobs = [a for a in all_assignments if a["date"] == inspection_date and a["inspector_id"] == pid]
-            person_jobs.sort(key=lambda x: x["sequence"])
+            person_jobs = [a for a in all_assignments if a["scheduled_date"] == inspection_date and a["inspector_id"] == pid]
+            person_jobs.sort(key=lambda x: x["sequence_in_route"])
             print(f"  {insp['full_name']}:")
             if not person_jobs:
                 print("    (no assignments)")
             else:
                 for a in person_jobs:
                     addr_str = address_by_id.get(a["inspection_id"], "?")
-                    print(f"    #{a['sequence']:02d} {a['start_time']}–{a['end_time']} | {addr_str} (travel {a['travel_mins_from_previous']}m)")
+                    print(f"    #{a['sequence_in_route']:02d} {a['start_time']}–{a['end_time']} | {addr_str} (travel {a['travel_from_previous_mins']}m)")
 
     metrics['execution_seconds'] = (datetime.now() - start_time).total_seconds()
     metrics['total_unscheduled'] = len(inspections) - metrics['total_scheduled']
@@ -913,7 +913,7 @@ def save_vrp_results(assignments, metrics):
     supabase.table('vrp_runs').insert({
         'id': run_id,
         'inspection_ids': [a['inspection_id'] for a in assignments],
-        'target_dates': list(set(a['date'] for a in assignments)),
+        'target_dates': list(set(a['scheduled_date'] for a in assignments)),
         'status': 'COMPLETED',
         'num_inspections_scheduled': metrics['total_scheduled'],
         'total_travel_minutes': metrics['total_travel_minutes'],
