@@ -424,7 +424,10 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         if i['lat'] is not None and i['lng'] is not None
     ]
 
-    # Availability
+    # ============================================================================
+    # CRITICAL FIX: Defensive availability time handling
+    # ============================================================================
+    print("\nFetching availability with defensive NULL handling...")
     availability_result = supabase.table('supabase_availability') \
         .select('inspector_id, date_local, start_time_local, end_time_local') \
         .eq('is_available', True) \
@@ -434,10 +437,25 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
     avail_map: Dict[Tuple[str, str], Dict[str, str]] = {}
     for avail in (availability_result.data or []):
         key = (avail['inspector_id'], str(avail['date_local']))
+        
+        # Defensive: Use defaults if times are NULL
+        start_time = avail.get('start_time_local')
+        end_time = avail.get('end_time_local')
+        
+        # Handle various None/null representations
+        if start_time is None or start_time == 'None' or str(start_time).lower() == 'none':
+            start_time = '08:00:00'
+            print(f"  ⚠️ Using default start time 08:00:00 for inspector {avail['inspector_id']}")
+        
+        if end_time is None or end_time == 'None' or str(end_time).lower() == 'none':
+            end_time = '16:00:00'
+            print(f"  ⚠️ Using default end time 16:00:00 for inspector {avail['inspector_id']}")
+        
         avail_map[key] = {
-            'start_time_local': str(avail['start_time_local']),
-            'end_time_local': str(avail['end_time_local'])
+            'start_time_local': str(start_time),
+            'end_time_local': str(end_time)
         }
+    # ============================================================================
 
     # Skills
     skills_result = supabase.table('inspector_skills') \
@@ -568,9 +586,27 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 
                 print(f"  {insp['full_name']}: {booked_minutes}m booked, {available_capacity}m remaining ({capacity_status}, {percent_booked}% booked)")
             else:
-                st = datetime.strptime(insp['start_time_local'], '%H:%M:%S').time()
-                et = datetime.strptime(insp['end_time_local'], '%H:%M:%S').time()
-                raw_capacity = (et.hour*60 + et.minute) - (st.hour*60 + st.minute)
+                # ============================================================
+                # DEFENSIVE: Parse times with error handling
+                # ============================================================
+                try:
+                    start_time_str = insp.get('start_time_local', '09:00:00')
+                    end_time_str = insp.get('end_time_local', '17:00:00')
+                    
+                    # Handle None values
+                    if start_time_str is None or str(start_time_str).lower() == 'none':
+                        start_time_str = '09:00:00'
+                    if end_time_str is None or str(end_time_str).lower() == 'none':
+                        end_time_str = '17:00:00'
+                    
+                    st = datetime.strptime(start_time_str, '%H:%M:%S').time()
+                    et = datetime.strptime(end_time_str, '%H:%M:%S').time()
+                    raw_capacity = (et.hour*60 + et.minute) - (st.hour*60 + st.minute)
+                except (ValueError, TypeError, AttributeError) as e:
+                    print(f"  ⚠️ WARNING: Could not parse times for {insp.get('full_name', '?')}: {e}, using defaults 09:00-17:00")
+                    raw_capacity = 8 * 60  # Default 8 hours
+                # ============================================================
+                
                 total_capacity += raw_capacity
                 print(f"  {insp['full_name']}: {raw_capacity}m available (no existing shifts)")
 
@@ -685,12 +721,30 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             start_index = routing.Start(v)
             end_index   = routing.End(v)
 
-            # Get base availability window
-            st = datetime.strptime(insp['start_time_local'], '%H:%M:%S').time()
-            et = datetime.strptime(insp['end_time_local'], '%H:%M:%S').time()
+            # ============================================================
+            # DEFENSIVE: Parse availability times with error handling
+            # ============================================================
+            try:
+                start_time_str = insp.get('start_time_local', '09:00:00')
+                end_time_str = insp.get('end_time_local', '17:00:00')
+                
+                # Handle None values
+                if start_time_str is None or str(start_time_str).lower() == 'none':
+                    start_time_str = '09:00:00'
+                if end_time_str is None or str(end_time_str).lower() == 'none':
+                    end_time_str = '17:00:00'
+                
+                st = datetime.strptime(start_time_str, '%H:%M:%S').time()
+                et = datetime.strptime(end_time_str, '%H:%M:%S').time()
+            except (ValueError, TypeError, AttributeError) as e:
+                print(f"  ⚠️ WARNING: Could not parse times for {insp.get('full_name', '?')}: {e}, using defaults")
+                st = datetime.strptime('09:00:00', '%H:%M:%S').time()
+                et = datetime.strptime('17:00:00', '%H:%M:%S').time()
+            
             start_min = st.hour * 60 + st.minute
             end_min = et.hour * 60 + et.minute
             original_start = start_min
+            # ============================================================
 
             # Check for existing shifts and adjust start time using capacity view
             key = (insp['full_name'], insp['date_local'])
@@ -812,9 +866,18 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             if route_nodes and route_nodes[0] >= JOB_OFFSET:
                 total_km_deci += kmdeci_matrix[prev_node][route_nodes[0]]
 
-            # First job starts at adjusted time (after shifts if any)
-            st = datetime.strptime(insp['start_time_local'], '%H:%M:%S').time()
-            start_min = st.hour * 60 + st.minute
+            # ============================================================
+            # DEFENSIVE: Parse times for solution extraction
+            # ============================================================
+            try:
+                start_time_str = insp.get('start_time_local', '09:00:00')
+                if start_time_str is None or str(start_time_str).lower() == 'none':
+                    start_time_str = '09:00:00'
+                st = datetime.strptime(start_time_str, '%H:%M:%S').time()
+                start_min = st.hour * 60 + st.minute
+            except (ValueError, TypeError, AttributeError):
+                start_min = 9 * 60  # Default 09:00
+            # ============================================================
             
             # Adjust for shifts
             key = (insp['inspector_id'], insp['date_local'])
