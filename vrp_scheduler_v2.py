@@ -691,7 +691,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         routing.SetArcCostEvaluatorOfAllVehicles(km_cb)
 
         # Prefer fewer inspectors
-        ROUTE_OPEN_COST_DECIKM = 500
+        ROUTE_OPEN_COST_DECIKM = 200
         for v in range(num_vehicles):
             routing.SetFixedCostOfVehicle(ROUTE_OPEN_COST_DECIKM, v)
 
