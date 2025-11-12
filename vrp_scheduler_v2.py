@@ -700,9 +700,21 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 # Find the latest shift end time
                 latest_shift_end_min = 0
                 for shift in inspector_shifts:
-                    shift_end = datetime.strptime(shift['end_time'], '%H:%M:%S').time()
-                    shift_end_min = shift_end.hour * 60 + shift_end.minute
-                    latest_shift_end_min = max(latest_shift_end_min, shift_end_min)
+                    # ============================================================
+                    # DEFENSIVE: Skip shifts with missing end_time
+                    # ============================================================
+                    if not shift.get('end_time'):
+                        print(f"    ⚠️ WARNING: Shift missing end_time for {insp['full_name']}, skipping")
+                        continue
+                        
+                    try:
+                        shift_end = datetime.strptime(shift['end_time'], '%H:%M:%S').time()
+                        shift_end_min = shift_end.hour * 60 + shift_end.minute
+                        latest_shift_end_min = max(latest_shift_end_min, shift_end_min)
+                    except (ValueError, TypeError) as e:
+                        print(f"    ⚠️ WARNING: Could not parse shift end_time '{shift.get('end_time')}': {e}")
+                        continue
+                    # ============================================================
                 
                 # Adjust start time to after latest shift (with 15 min buffer)
                 if latest_shift_end_min > start_min:
@@ -809,9 +821,20 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             if key in shifts_by_inspector_date:
                 latest_end = 0
                 for shift in shifts_by_inspector_date[key]:
-                    shift_end = datetime.strptime(shift['end_time_local'], '%H:%M:%S').time()
-                    shift_end_min = shift_end.hour * 60 + shift_end.minute
-                    latest_end = max(latest_end, shift_end_min)
+                    # ============================================================
+                    # DEFENSIVE: Skip shifts with missing end_time_local
+                    # ============================================================
+                    if not shift.get('end_time_local'):
+                        continue
+                        
+                    try:
+                        shift_end = datetime.strptime(shift['end_time_local'], '%H:%M:%S').time()
+                        shift_end_min = shift_end.hour * 60 + shift_end.minute
+                        latest_end = max(latest_end, shift_end_min)
+                    except (ValueError, TypeError):
+                        continue
+                    # ============================================================
+                    
                 if latest_end > start_min:
                     start_min = latest_end + 15
             
