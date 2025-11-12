@@ -804,17 +804,23 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
                 job = inspection_nodes[node - JOB_OFFSET]
                 
-                # Calculate travel time FROM PREVIOUS location TO THIS location
-                if prev_node >= JOB_OFFSET:
-                    # Previous was a job
+                # ============================================================
+                # CHANGE: Skip travel time for first job (starts at 09:00)
+                # ============================================================
+                if sequence == 0:
+                    # First job: starts at inspector's available time, no travel time added
+                    travel_min_to_here = 0
+                elif prev_node >= JOB_OFFSET:
+                    # Subsequent jobs: calculate travel time from previous job
                     travel_min_to_here = minutes_matrix[prev_node][node]
                     if travel_min_to_here == 0:
                         travel_min_to_here = 5  # Minimum buffer
                 else:
-                    # Previous was home
+                    # Should not happen for non-first jobs
                     travel_min_to_here = minutes_matrix[prev_node][node]
-                
-                # Add travel time BEFORE starting this job
+                # ============================================================
+
+                # Add travel time BEFORE starting this job (0 for first job)
                 current_min += travel_min_to_here
 
                 # Schedule start (rounded to 5 min)
