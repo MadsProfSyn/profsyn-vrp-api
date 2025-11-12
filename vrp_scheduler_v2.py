@@ -145,8 +145,26 @@ def schedule_inspections_with_queue(inspection_ids: List[str], target_dates: Lis
         Dict with job_id and initial status, or error if job cannot start
     """
     
+    # Clean up any stale jobs (older than 5 minutes in running state)
+    print("\n🧹 Checking for stale jobs...")
+    try:
+        cutoff = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+        stale_result = supabase.table('job_queue').update({
+            'status': 'failed',
+            'error': 'Job timed out - marked as stale',
+            'completed_at': datetime.utcnow().isoformat()
+        }).eq('status', 'running').lt('started_at', cutoff).execute()
+        
+        if stale_result.data and len(stale_result.data) > 0:
+            print(f"⚠️ Cleaned up {len(stale_result.data)} stale jobs")
+        else:
+            print("✓ No stale jobs found")
+    except Exception as e:
+        print(f"⚠️ Warning: Could not clean up stale jobs: {e}")
+    
     # Check if another job is running
     if not job_queue.can_start_job():
+        print("❌ Another VRP job is currently running")
         return {
             'error': 'Another VRP calculation is currently running. Please wait and try again.',
             'status': 'blocked'
@@ -163,6 +181,7 @@ def schedule_inspections_with_queue(inspection_ids: List[str], target_dates: Lis
     )
     
     if not job_id:
+        print("❌ Failed to create job in queue")
         return {
             'error': 'Failed to create job in queue',
             'status': 'error'
@@ -175,17 +194,23 @@ def schedule_inspections_with_queue(inspection_ids: List[str], target_dates: Lis
     try:
         # Start the job
         if not job_queue.start_job(job_id):
+            print(f"❌ Failed to start job {job_id} - cleaning up")
+            # Clean up the failed job attempt
+            job_queue.fail_job(job_id, "Failed to start job - database connection issue")
             return {
-                'error': 'Failed to start job',
+                'error': 'Failed to start job due to database connection issue',
                 'status': 'error',
                 'job_id': job_id
             }
+        
+        print(f"✓ Job {job_id} started successfully")
         
         # Run the actual VRP calculation
         result = run_vrp_for_inspections(inspection_ids, target_dates)
         
         # Check if there was an error in VRP execution
         if 'error' in result:
+            print(f"❌ VRP execution failed: {result['error']}")
             job_queue.fail_job(job_id, result['error'])
             return {
                 'error': result['error'],
