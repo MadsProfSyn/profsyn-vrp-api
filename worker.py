@@ -1,7 +1,7 @@
 import time
 import os
 from datetime import datetime, timedelta
-from main import run_vrp_for_inspections, save_vrp_results, job_queue, supabase
+from vrp_scheduler_v2 import run_vrp_for_inspections, save_vrp_results, job_queue, supabase
 import traceback
 
 def worker_loop():
