@@ -1,6 +1,6 @@
 """
 Flask API with Job Queue for VRP Scheduler
-Replace your app.py with this file
+Worker-compatible version - creates jobs but doesn't execute them
 """
 
 from flask import Flask, request, jsonify
@@ -8,12 +8,10 @@ from flask_cors import CORS
 import os
 from dotenv import load_dotenv
 import traceback
-import uuid
-from datetime import datetime
-from typing import Optional, Dict, List
+from datetime import datetime, timedelta
 
 # Import VRP functions
-from vrp_scheduler_v2 import run_vrp_for_inspections, save_vrp_results, supabase, JobQueue, job_queue
+from vrp_scheduler_v2 import supabase, JobQueue, job_queue
 
 load_dotenv()
 
@@ -28,7 +26,11 @@ CORS(app, origins=["*"])  # Restrict this in production
 
 @app.route("/")
 def root():
-    return jsonify({"status": "Profsyn VRP API with Job Queue", "version": "2.0"})
+    return jsonify({
+        "status": "Profsyn VRP API with Job Queue", 
+        "version": "3.0",
+        "mode": "worker-based"
+    })
 
 @app.route("/health")
 def health():
@@ -60,8 +62,8 @@ def vrp_available():
 @app.route("/api/schedule", methods=["POST"])
 def schedule_inspections():
     """
-    Start a new VRP job with queue management.
-    Prevents concurrent executions.
+    Create a VRP job (worker will pick it up and execute).
+    Returns immediately with job_id for status polling.
     """
     try:
         data = request.get_json()
@@ -87,17 +89,37 @@ def schedule_inspections():
                 'error': 'inspection_ids cannot be empty'
             }), 400
         
-        print(f"📥 Received request: {len(inspection_ids)} inspections, dates: {target_dates}")
+        print(f"\n{'='*60}")
+        print(f"📥 Received schedule request")
+        print(f"   Inspections: {len(inspection_ids)}")
+        print(f"   Dates: {target_dates}")
+        print(f"   Requested by: {requested_by}")
+        print(f"{'='*60}")
+        
+        # Clean up stale jobs first (older than 5 minutes)
+        try:
+            cutoff = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+            stale_result = supabase.table('job_queue').update({
+                'status': 'failed',
+                'error': 'Job timed out - marked as stale',
+                'completed_at': datetime.utcnow().isoformat()
+            }).eq('status', 'running').lt('started_at', cutoff).execute()
+            
+            if stale_result.data and len(stale_result.data) > 0:
+                print(f"⚠️  Cleaned up {len(stale_result.data)} stale job(s)")
+        except Exception as e:
+            print(f"⚠️  Warning: Could not clean up stale jobs: {e}")
         
         # Check if another job is running
         if not job_queue.can_start_job():
+            print("❌ Another VRP job is currently running")
             return jsonify({
                 'status': 'blocked',
                 'message': 'Another VRP calculation is currently running. Please wait and try again.',
                 'retry_after': 30
             }), 409
         
-        # Create job
+        # Create job (worker will execute it)
         job_id = job_queue.create_job(
             job_type='vrp_calculation',
             params={
@@ -108,80 +130,38 @@ def schedule_inspections():
         )
         
         if not job_id:
+            print("❌ Failed to create job in queue")
             return jsonify({
                 'error': 'Failed to create job in queue',
                 'status': 'error'
             }), 500
         
-        print(f"🚀 Starting VRP Job: {job_id}")
+        print(f"✅ Created job: {job_id}")
+        print(f"   Status: pending (worker will process)")
+        print(f"{'='*60}\n")
         
-        # Start the job
-        if not job_queue.start_job(job_id):
-            return jsonify({
-                'error': 'Failed to start job',
-                'status': 'error',
-                'job_id': job_id
-            }), 500
-        
-        # Run the actual VRP calculation
-        result = run_vrp_for_inspections(inspection_ids, target_dates)
-        
-        # Check if there was an error in VRP execution
-        if 'error' in result:
-            job_queue.fail_job(job_id, result['error'])
-            return jsonify({
-                'error': result['error'],
-                'status': 'failed',
-                'job_id': job_id
-            }), 500
-        
-        # Save results to database
-        run_id = save_vrp_results(result['assignments'], result['metrics'])
-        
-        # Complete the job with results summary
-        job_queue.complete_job(job_id, {
-            'vrp_run_id': run_id,
-            'total_scheduled': result['metrics']['total_scheduled'],
-            'total_unscheduled': result['metrics']['total_unscheduled'],
-            'total_travel_minutes': result['metrics']['total_travel_minutes'],
-            'total_travel_km': result['metrics'].get('total_travel_km', 0),
-            'execution_seconds': result['metrics']['execution_seconds']
-        })
-        
-        print(f"✅ VRP Job Completed: {job_id}")
-        
+        # Return immediately - worker will process
         return jsonify({
-            'status': 'completed',
+            'status': 'pending',
             'job_id': job_id,
-            'vrp_run_id': run_id,
-            'summary': {
-                'total_scheduled': result['metrics']['total_scheduled'],
-                'total_unscheduled': result['metrics']['total_unscheduled'],
-                'total_travel_minutes': result['metrics']['total_travel_minutes'],
-                'total_travel_km': result['metrics'].get('total_travel_km', 0),
-                'execution_seconds': result['metrics']['execution_seconds']
-            }
-        }), 200
+            'message': 'Job queued for processing. Use /api/job-status/{job_id} to check progress.'
+        }), 202  # 202 Accepted
         
     except Exception as e:
         error_msg = f"{str(e)}\n{traceback.format_exc()}"
-        print(f"❌ VRP Job Failed")
+        print(f"❌ Failed to create job")
         print(f"Error: {error_msg}")
-        
-        if 'job_id' in locals():
-            job_queue.fail_job(job_id, error_msg)
         
         return jsonify({
             'error': str(e),
-            'status': 'failed',
-            'job_id': locals().get('job_id')
+            'status': 'failed'
         }), 500
 
 @app.route("/api/job-status/<job_id>", methods=["GET"])
 def check_job_status(job_id):
     """
     Check the status of a VRP job.
-    Used by frontend for polling.
+    Used by frontend/edge function for polling.
     """
     try:
         status = job_queue.get_job_status(job_id)
@@ -208,6 +188,79 @@ def check_job_status(job_id):
             'error': f'Server error: {str(e)}'
         }), 500
 
+@app.route("/api/job/<job_id>", methods=["GET"])
+def check_job_status_alt(job_id):
+    """
+    Alternative route for job status (for compatibility).
+    """
+    return check_job_status(job_id)
+
+# ============================================================================
+# ADMIN ENDPOINTS
+# ============================================================================
+
+@app.route("/api/admin/clear-stuck-jobs", methods=["POST"])
+def clear_stuck_jobs():
+    """
+    Admin endpoint to manually clear stuck jobs.
+    Useful if worker goes down and jobs get stuck.
+    """
+    try:
+        result = supabase.table('job_queue').update({
+            'status': 'failed',
+            'error': 'Manually cleared by admin',
+            'completed_at': datetime.utcnow().isoformat()
+        }).in_('status', ['running', 'pending']).execute()
+        
+        count = len(result.data) if result.data else 0
+        
+        print(f"🧹 Admin cleared {count} stuck job(s)")
+        
+        return jsonify({
+            'success': True,
+            'cleared_count': count,
+            'message': f'Cleared {count} stuck job(s)'
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Error clearing stuck jobs: {str(e)}")
+        return jsonify({
+            'error': str(e)
+        }), 500
+
+@app.route("/api/admin/job-queue-status", methods=["GET"])
+def job_queue_status():
+    """
+    Admin endpoint to see current job queue state.
+    """
+    try:
+        # Get all recent jobs
+        result = supabase.table('job_queue')\
+            .select('*')\
+            .order('created_at', desc=True)\
+            .limit(20)\
+            .execute()
+        
+        jobs = result.data or []
+        
+        # Count by status
+        status_counts = {}
+        for job in jobs:
+            status = job['status']
+            status_counts[status] = status_counts.get(status, 0) + 1
+        
+        return jsonify({
+            'total_jobs': len(jobs),
+            'status_counts': status_counts,
+            'recent_jobs': jobs[:5]  # Most recent 5
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Error getting queue status: {str(e)}")
+        return jsonify({
+            'error': str(e)
+        }), 500
+
 # ============================================================================
 # LEGACY ENDPOINT (Keep for backwards compatibility during transition)
 # ============================================================================
@@ -222,9 +275,34 @@ def schedule_legacy():
     return schedule_inspections()
 
 # ============================================================================
+# ERROR HANDLERS
+# ============================================================================
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({
+        'error': 'Endpoint not found',
+        'message': str(e)
+    }), 404
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({
+        'error': 'Internal server error',
+        'message': str(e)
+    }), 500
+
+# ============================================================================
 # RUN THE APP
 # ============================================================================
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
+    print(f"\n{'='*60}")
+    print(f"🚀 Starting Profsyn VRP API")
+    print(f"   Port: {port}")
+    print(f"   Mode: Worker-based (async)")
+    print(f"   Environment: {os.getenv('RAILWAY_ENVIRONMENT', 'local')}")
+    print(f"{'='*60}\n")
+    
     app.run(host="0.0.0.0", port=port, debug=False)
