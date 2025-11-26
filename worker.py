@@ -4,7 +4,13 @@ from datetime import datetime, timedelta
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
-from vrp_scheduler_v2 import run_vrp_for_inspections, save_vrp_results, job_queue, supabase
+from vrp_scheduler_v2 import (
+    run_vrp_for_inspections, 
+    save_vrp_results, 
+    job_queue, 
+    supabase,
+    generate_vrp_explanation  # NEW: Import AI explanation generator
+)
 import traceback
 
 # ============================================================================
@@ -80,6 +86,7 @@ def worker_loop():
     print(f"   Time: {worker_status['started_at']}")
     print(f"   Polling interval: 3 seconds")
     print(f"   Health endpoint: http://0.0.0.0:{os.getenv('PORT', 8080)}/health")
+    print(f"   AI Explanations: {'Enabled' if os.getenv('OPENAI_API_KEY') else 'Disabled (no API key)'}")
     print("="*60)
     
     consecutive_errors = 0
@@ -146,19 +153,35 @@ def worker_loop():
                         print(f"❌ Job {job_id} failed: {result['error']}")
                         worker_status['last_job_status'] = 'failed'
                     else:
-                        run_id = save_vrp_results(result['assignments'], result['metrics'])
+                        # ============================================================
+                        # NEW: Generate AI explanation from decision data
+                        # ============================================================
+                        ai_explanation = None
+                        if result.get('decision_data'):
+                            ai_explanation = generate_vrp_explanation(result['decision_data'])
+                        # ============================================================
+                        
+                        # Save results with AI explanation
+                        run_id = save_vrp_results(
+                            result['assignments'], 
+                            result['metrics'],
+                            ai_explanation  # NEW: Pass explanation to save function
+                        )
+                        
                         job_queue.complete_job(job_id, {
                             'vrp_run_id': run_id,
                             'total_scheduled': result['metrics']['total_scheduled'],
                             'total_unscheduled': result['metrics']['total_unscheduled'],
                             'total_travel_minutes': result['metrics']['total_travel_minutes'],
                             'total_travel_km': result['metrics'].get('total_travel_km', 0),
-                            'execution_seconds': result['metrics']['execution_seconds']
+                            'execution_seconds': result['metrics']['execution_seconds'],
+                            'has_explanation': ai_explanation is not None  # NEW: Track if explanation was generated
                         })
                         print(f"✅ Job {job_id} completed successfully")
                         print(f"   VRP Run ID: {run_id}")
                         print(f"   Scheduled: {result['metrics']['total_scheduled']} inspections")
                         print(f"   Travel: {result['metrics']['total_travel_km']:.1f} km")
+                        print(f"   AI Explanation: {'Generated' if ai_explanation else 'Not generated'}")
                         
                         worker_status['last_job_status'] = 'completed'
                         worker_status['jobs_processed'] += 1
