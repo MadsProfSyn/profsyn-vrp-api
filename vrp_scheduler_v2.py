@@ -148,44 +148,48 @@ def generate_vrp_explanation(decision_data: Dict) -> Optional[str]:
     
     print("\n🤖 Generating AI explanation of VRP decisions...")
     
-    system_prompt = """Du forklarer ruteplanlægning for boligsyn på dansk. Vær KORT og FAKTUEL.
+    system_prompt = """Du forklarer ruteplanlægning for boligsyn på dansk. Vær MEGET KORT og fokuser på HVORFOR.
+
+FORMÅL: Brugeren vil vide HVORFOR specifikke synskonsulenter blev valgt frem for andre.
+
+ANALYSE DU SKAL LAVE:
+1. Find geografisk klynge for hvert syn-område (fx "Nordsjælland", "Odense-området", "Aarhus")
+2. Identificer HOVEDÅRSAGEN til at hver konsulent blev valgt (fx: bor tæt på, ingen vagter, lav kørsel)
+3. Gruppér ikke-brugte konsulenter efter ÅRSAG (eksisterende vagter, fuldt booket, ikke nødvendige)
+
+FORMAT (følg præcis):
+
+**[Navn]** – [antal] syn i [område]
+[By1] → [By2] → [By3]
+Valgt fordi: [1 sætning - den vigtigste grund]
+
+**[Næste navn]** – [antal] syn i [område]
+...
+
+**Ikke brugte**
+- [X] havde eksisterende vagter (først ledige kl. [tidspunkt])
+- [X] var fuldt booket
+- Øvrige: Ikke nødvendige – ovenstående dækkede behovet
+
+**Resultat:** [X] syn · [X] konsulent(er) · [X] km kørsel
 
 REGLER:
-- Kun fakta, ingen ros af algoritmen
-- Ingen indledning om "hvad VRP gør"
-- Ingen afsluttende opsummering
-- Maks 2-3 sætninger per synskonsulent
-- Brug kun data fra input - opfind ikke detaljer
+- Maks 1-2 sætninger per konsulent
+- Brug → til at vise ruten mellem byer
+- Gruppér årsager for ikke-brugte (tæl dem, list ikke alle navne)
+- Ingen indledning, ingen afsluttende kommentarer
+- "Valgt fordi:" skal være den VIGTIGSTE grund (geografisk nærhed, ingen vagter, kompetencer)"""
 
-FORMAT (brug præcis dette):
-
-**Tildelte synskonsulenter**
-
-**[Navn]** – [antal] syn
-- [Adresse 1]: [syntype], [tidspunkt]
-- [Adresse 2]: [syntype], [tidspunkt]
-- Valgt fordi: [1 kort sætning - fx geografisk placering, kompetencer, ledig kapacitet]
-
-**[Navn]** – [antal] syn
-- ...
-
-**Ikke brugte synskonsulenter**
-[Liste med navne] – Ikke nødvendige da ovenstående dækkede behovet.
-[Hvis nogen havde eksisterende vagter, nævn det kort]
-
-**Resultat**
-- Syn planlagt: [antal]
-- Synskonsulenter brugt: [antal] af [antal tilgængelige]
-- Total kørsel: [X] km
-- Total køretid: [X] min
-
-VIGTIGT: Skriv IKKE sætninger som "algoritmen har effektivt...", "dette viser at...", eller "ved at begrænse...". Kun fakta."""
-
-    user_prompt = f"""Forklar disse rutetildelinger kort og faktuelt:
+    user_prompt = f"""Analysér disse rutetildelinger og forklar HVORFOR hver konsulent blev valgt:
 
 {json.dumps(decision_data, indent=2, ensure_ascii=False)}
 
-Husk: Kun fakta, ingen ros eller meta-kommentarer."""
+VIGTIGST: 
+- Hvem havde eksisterende vagter? (se "inspectors_with_existing_shifts" og "Adjusted start" i data)
+- Hvem bor tæt på synene? (geografisk match)
+- Hvor mange km kørsel mellem synene?
+
+Giv kort forklaring per valgt konsulent og gruppér årsager for ikke-brugte."""
 
     try:
         response = requests.post(
@@ -200,8 +204,8 @@ Husk: Kun fakta, ingen ros eller meta-kommentarer."""
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                "max_tokens": 1200,
-                "temperature": 0.3
+                "max_tokens": 800,
+                "temperature": 0.2
             },
             timeout=60
         )
