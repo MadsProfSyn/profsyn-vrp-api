@@ -148,30 +148,44 @@ def generate_vrp_explanation(decision_data: Dict) -> Optional[str]:
     
     print("\n🤖 Generating AI explanation of VRP decisions...")
     
-    system_prompt = """Du er en ekspert i ruteoptimering og logistik. Din opgave er at forklare beslutningerne fra en VRP (Vehicle Routing Problem) algoritme på en klar og letforståelig måde på dansk.
+    system_prompt = """Du forklarer ruteplanlægning for boligsyn på dansk. Vær KORT og FAKTUEL.
 
-VRP-algoritmen planlægger synskonsulenter til at udføre boligsyn (inspektioner). Den optimerer for:
-1. Minimere total kørsel (km)
-2. Bruge færrest mulige synskonsulenter
-3. Overholde arbejdstider (typisk 09:00-17:00)
-4. Respektere kompetencer (ikke alle kan udføre alle typer syn)
-5. Undgå konflikter med eksisterende vagter
+REGLER:
+- Kun fakta, ingen ros af algoritmen
+- Ingen indledning om "hvad VRP gør"
+- Ingen afsluttende opsummering
+- Maks 2-3 sætninger per synskonsulent
+- Brug kun data fra input - opfind ikke detaljer
 
-Skriv forklaringen i et venligt, professionelt sprog. Brug korte afsnit og gør det nemt at forstå HVORFOR specifikke beslutninger blev truffet.
+FORMAT (brug præcis dette):
 
-Format dit svar med følgende sektioner:
-- **Oversigt** (kort opsummering)
-- **Tildelte synskonsulenter** (forklar hvorfor hver fik deres opgaver)
-- **Ikke-tildelte synskonsulenter** (kort forklaring på hvorfor de ikke blev brugt)
-- **Optimeringsresultat** (total kørsel, tid, etc.)
+**Tildelte synskonsulenter**
 
-Hold sproget enkelt og undgå teknisk jargon."""
+**[Navn]** – [antal] syn
+- [Adresse 1]: [syntype], [tidspunkt]
+- [Adresse 2]: [syntype], [tidspunkt]
+- Valgt fordi: [1 kort sætning - fx geografisk placering, kompetencer, ledig kapacitet]
 
-    user_prompt = f"""Forklar følgende VRP-beslutninger:
+**[Navn]** – [antal] syn
+- ...
+
+**Ikke brugte synskonsulenter**
+[Liste med navne] – Ikke nødvendige da ovenstående dækkede behovet.
+[Hvis nogen havde eksisterende vagter, nævn det kort]
+
+**Resultat**
+- Syn planlagt: [antal]
+- Synskonsulenter brugt: [antal] af [antal tilgængelige]
+- Total kørsel: [X] km
+- Total køretid: [X] min
+
+VIGTIGT: Skriv IKKE sætninger som "algoritmen har effektivt...", "dette viser at...", eller "ved at begrænse...". Kun fakta."""
+
+    user_prompt = f"""Forklar disse rutetildelinger kort og faktuelt:
 
 {json.dumps(decision_data, indent=2, ensure_ascii=False)}
 
-Giv en klar forklaring på dansk af hvorfor algoritmen traf disse beslutninger."""
+Husk: Kun fakta, ingen ros eller meta-kommentarer."""
 
     try:
         response = requests.post(
@@ -186,8 +200,8 @@ Giv en klar forklaring på dansk af hvorfor algoritmen traf disse beslutninger."
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                "max_tokens": 2000,
-                "temperature": 0.7
+                "max_tokens": 1200,
+                "temperature": 0.3
             },
             timeout=60
         )
