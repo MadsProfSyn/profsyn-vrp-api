@@ -1026,6 +1026,10 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         day_midnight = tz.localize(datetime.combine(base_date, datetime.min.time()))
 
         total_km_deci = 0
+        
+        # Track per-inspector km for storage
+        inspector_route_km: Dict[str, float] = {}
+        
         for v in range(num_vehicles):
             insp = date_inspectors[v]
             name = insp['full_name']
@@ -1047,10 +1051,36 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 node = mgr.IndexToNode(prev_index)
                 route_nodes.append(node)
 
-            # From HOME -> first (km only)
-            prev_node = starts[v]
+            # ============================================================
+            # Calculate per-inspector total km (home → jobs → home)
+            # ============================================================
+            inspector_km_deci = 0
+            
+            # Home → first job
             if route_nodes and route_nodes[0] >= JOB_OFFSET:
-                total_km_deci += kmdeci_matrix[prev_node][route_nodes[0]]
+                inspector_km_deci += kmdeci_matrix[starts[v]][route_nodes[0]]
+            
+            # Job → job (all intermediate legs)
+            km_prev = starts[v]
+            for node in route_nodes:
+                if node >= JOB_OFFSET:  # Only count actual job nodes
+                    inspector_km_deci += kmdeci_matrix[km_prev][node]
+                km_prev = node
+            
+            # Last job → home
+            if route_nodes:
+                last_job_node = route_nodes[-1] if route_nodes[-1] >= JOB_OFFSET else starts[v]
+                inspector_km_deci += kmdeci_matrix[last_job_node][ends[v]]
+            
+            # Store for this inspector (convert from deci-km to km)
+            inspector_route_km[insp['inspector_id']] = round(inspector_km_deci / 10.0, 1)
+            
+            # Add to global total
+            total_km_deci += inspector_km_deci
+            # ============================================================
+
+            # From HOME -> first (km only) - already counted above, skip duplicate
+            prev_node = starts[v]
 
             # ============================================================
             # DEFENSIVE: Parse times for solution extraction
@@ -1142,7 +1172,8 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                     'start_time': start_dt.time().isoformat(),
                     'end_time': (day_midnight + timedelta(minutes=end_minute)).time().isoformat(),
                     'sequence_in_route': sequence,
-                    'travel_from_previous_mins': travel_min_to_here
+                    'travel_from_previous_mins': travel_min_to_here,
+                    'inspector_route_km': inspector_route_km.get(insp['inspector_id'], 0)  # NEW: per-inspector total km
                 }
                 all_assignments.append(assignment)
                 
@@ -1164,21 +1195,12 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
                 prev_node = node
 
-            # Job->home travel (km only)
-            last_job_node = prev_node
-            total_km_deci += kmdeci_matrix[last_job_node][ends[v]]
-
-            # Sum km arcs
-            km_prev = starts[v]
-            for node in route_nodes:
-                total_km_deci += kmdeci_matrix[km_prev][node]
-                km_prev = node
-
             # Print return home
             if route_nodes:
                 last_addr = inspection_nodes[route_nodes[-1] - JOB_OFFSET].get('address') if route_nodes[-1] >= JOB_OFFSET else "HOME"
                 back_km = kmdeci_matrix[route_nodes[-1]][ends[v]] / 10.0
                 print(f"  {name}: → HOME from {last_addr} ({back_km:.1f} km)")
+                print(f"  {name}: Total route: {inspector_route_km.get(insp['inspector_id'], 0)} km")
             
             # Collect assignment for AI
             if inspector_route:
@@ -1187,22 +1209,25 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                     'home_address': insp.get('home_address', 'Ukendt'),
                     'total_inspections': len(inspector_route),
                     'total_travel_minutes': sum(r['travel_minutes'] for r in inspector_route),
+                    'total_route_km': inspector_route_km.get(insp['inspector_id'], 0),  # NEW: include total km
                     'route': inspector_route
                 })
 
         metrics['total_travel_km'] += total_km_deci / 10.0
 
         # Per-inspector summary
-        per_insp = defaultdict(lambda: {"count": 0, "travel_min": 0})
+        per_insp = defaultdict(lambda: {"count": 0, "travel_min": 0, "route_km": 0})
         for a in [a for a in all_assignments if a["scheduled_date"] == inspection_date]:
             per_insp[a["inspector_id"]]["count"] += 1
             per_insp[a["inspector_id"]]["travel_min"] += a["travel_from_previous_mins"]
+            per_insp[a["inspector_id"]]["route_km"] = a.get("inspector_route_km", 0)
 
         id_to_name = {i["inspector_id"]: i["full_name"] for i in date_inspectors}
         print("\nActual assignments per inspector (this date):")
         for insp in date_inspectors:
             pid = insp["inspector_id"]
-            print(f"  {id_to_name[pid]} → {per_insp[pid]['count']} visits (job→job travel {per_insp[pid]['travel_min']} min)")
+            if per_insp[pid]["count"] > 0:
+                print(f"  {id_to_name[pid]} → {per_insp[pid]['count']} visits, {per_insp[pid]['route_km']} km total route")
 
         # Itineraries
         print("\nDetailed itineraries (with addresses):")
