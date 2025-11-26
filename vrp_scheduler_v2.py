@@ -11,11 +11,13 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 import uuid
 import traceback
+import requests
 
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ============================================================================
@@ -127,6 +129,83 @@ class JobQueue:
 job_queue = JobQueue(supabase)
 
 # ============================================================================
+# OPENAI EXPLANATION GENERATOR
+# ============================================================================
+
+def generate_vrp_explanation(decision_data: Dict) -> Optional[str]:
+    """
+    Send VRP decision data to OpenAI and get a human-readable explanation in Danish.
+    
+    Args:
+        decision_data: Structured data about VRP decisions
+    
+    Returns:
+        Danish explanation string or None if failed
+    """
+    if not OPENAI_API_KEY:
+        print("⚠️ OPENAI_API_KEY not set - skipping explanation generation")
+        return None
+    
+    print("\n🤖 Generating AI explanation of VRP decisions...")
+    
+    system_prompt = """Du er en ekspert i ruteoptimering og logistik. Din opgave er at forklare beslutningerne fra en VRP (Vehicle Routing Problem) algoritme på en klar og letforståelig måde på dansk.
+
+VRP-algoritmen planlægger synskonsulenter til at udføre boligsyn (inspektioner). Den optimerer for:
+1. Minimere total kørsel (km)
+2. Bruge færrest mulige synskonsulenter
+3. Overholde arbejdstider (typisk 09:00-17:00)
+4. Respektere kompetencer (ikke alle kan udføre alle typer syn)
+5. Undgå konflikter med eksisterende vagter
+
+Skriv forklaringen i et venligt, professionelt sprog. Brug korte afsnit og gør det nemt at forstå HVORFOR specifikke beslutninger blev truffet.
+
+Format dit svar med følgende sektioner:
+- **Oversigt** (kort opsummering)
+- **Tildelte synskonsulenter** (forklar hvorfor hver fik deres opgaver)
+- **Ikke-tildelte synskonsulenter** (kort forklaring på hvorfor de ikke blev brugt)
+- **Optimeringsresultat** (total kørsel, tid, etc.)
+
+Hold sproget enkelt og undgå teknisk jargon."""
+
+    user_prompt = f"""Forklar følgende VRP-beslutninger:
+
+{json.dumps(decision_data, indent=2, ensure_ascii=False)}
+
+Giv en klar forklaring på dansk af hvorfor algoritmen traf disse beslutninger."""
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                "max_tokens": 2000,
+                "temperature": 0.7
+            },
+            timeout=60
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            explanation = result['choices'][0]['message']['content']
+            print("✅ AI explanation generated successfully")
+            return explanation
+        else:
+            print(f"❌ OpenAI API error: {response.status_code} - {response.text}")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Error generating explanation: {e}")
+        return None
+
+# ============================================================================
 # MAIN VRP EXECUTION WRAPPER - Entry point with job management
 # ============================================================================
 
@@ -218,8 +297,13 @@ def schedule_inspections_with_queue(inspection_ids: List[str], target_dates: Lis
                 'job_id': job_id
             }
         
-        # Save results to database
-        run_id = save_vrp_results(result['assignments'], result['metrics'])
+        # Generate AI explanation
+        ai_explanation = None
+        if result.get('decision_data'):
+            ai_explanation = generate_vrp_explanation(result['decision_data'])
+        
+        # Save results to database (including explanation)
+        run_id = save_vrp_results(result['assignments'], result['metrics'], ai_explanation)
         
         # Complete the job with results summary
         job_queue.complete_job(job_id, {
@@ -228,7 +312,8 @@ def schedule_inspections_with_queue(inspection_ids: List[str], target_dates: Lis
             'total_unscheduled': result['metrics']['total_unscheduled'],
             'total_travel_minutes': result['metrics']['total_travel_minutes'],
             'total_travel_km': result['metrics'].get('total_travel_km', 0),
-            'execution_seconds': result['metrics']['execution_seconds']
+            'execution_seconds': result['metrics']['execution_seconds'],
+            'has_explanation': ai_explanation is not None
         })
         
         print(f"\n✅ VRP Job Completed: {job_id}")
@@ -243,7 +328,8 @@ def schedule_inspections_with_queue(inspection_ids: List[str], target_dates: Lis
                 'total_unscheduled': result['metrics']['total_unscheduled'],
                 'total_travel_minutes': result['metrics']['total_travel_minutes'],
                 'total_travel_km': result['metrics'].get('total_travel_km', 0),
-                'execution_seconds': result['metrics']['execution_seconds']
+                'execution_seconds': result['metrics']['execution_seconds'],
+                'has_explanation': ai_explanation is not None
             }
         }
         
@@ -383,8 +469,26 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
     Feasibility/time: minutes matrix. First job at 09:00 sharp per used inspector. Return-to-home required.
     Home→first and last→home legs count in objective km, but do NOT consume day time.
     Last inspection must finish by 17:00 (soft to 17:15).
+    
+    Now also captures decision data for AI explanation.
     """
     print(f"Starting VRP for {len(inspection_ids)} inspections across {len(target_dates)} dates")
+
+    # ============================================================================
+    # DECISION DATA COLLECTION - For AI explanation
+    # ============================================================================
+    decision_data = {
+        'date': target_dates[0] if len(target_dates) == 1 else target_dates,
+        'total_inspections_requested': len(inspection_ids),
+        'inspections': [],
+        'inspectors_available': [],
+        'inspectors_with_existing_shifts': [],
+        'skill_constraints': [],
+        'assignments': [],
+        'unassigned_inspectors': [],
+        'optimization_result': {},
+        'routing_decisions': []
+    }
 
     # Get inspections
     inspections_result = supabase.table('inspection_queue') \
@@ -413,6 +517,16 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
             )
         else:
             ins['duration_minutes'] = 45
+        
+        # Collect inspection data for AI
+        decision_data['inspections'].append({
+            'id': ins['id'],
+            'address': ins.get('address', 'Ukendt adresse'),
+            'type': ins['inspection_type'],
+            'rooms': ins['rooms'],
+            'duration_minutes': ins['duration_minutes'],
+            'date': ins['preferred_date']
+        })
 
     # Get active inspectors with homes
     inspectors_result = supabase.table('inspectors') \
@@ -518,6 +632,16 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         
         if capacity.get('shift_details'):
             shifts_by_inspector_date[key] = capacity['shift_details']
+        
+        # Collect for AI explanation
+        decision_data['inspectors_with_existing_shifts'].append({
+            'name': capacity['inspector_name'],
+            'date': capacity['date_local'],
+            'existing_shifts': capacity['scheduled_shifts'],
+            'booked_minutes': capacity['booked_minutes'],
+            'remaining_minutes': capacity['remaining_minutes'],
+            'capacity_status': capacity['capacity_status']
+        })
 
     print(f"Loaded capacity data for {len(capacity_by_inspector_date)} inspector-date combinations")
 
@@ -575,6 +699,13 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         for insp in date_inspectors:
             key = (insp['full_name'], insp['date_local'])
             
+            inspector_info = {
+                'name': insp['full_name'],
+                'home_address': insp.get('home_address', 'Ukendt'),
+                'skills': insp['can_do_types'],
+                'date': insp['date_local']
+            }
+            
             if key in capacity_by_inspector_date:
                 capacity_data = capacity_by_inspector_date[key]
                 available_capacity = capacity_data['remaining_minutes']
@@ -583,6 +714,10 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 percent_booked = capacity_data['percent_booked']
                 
                 total_capacity += available_capacity
+                inspector_info['available_minutes'] = available_capacity
+                inspector_info['booked_minutes'] = booked_minutes
+                inspector_info['has_existing_shifts'] = True
+                inspector_info['capacity_status'] = capacity_status
                 
                 print(f"  {insp['full_name']}: {booked_minutes}m booked, {available_capacity}m remaining ({capacity_status}, {percent_booked}% booked)")
             else:
@@ -608,7 +743,13 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 # ============================================================
                 
                 total_capacity += raw_capacity
+                inspector_info['available_minutes'] = raw_capacity
+                inspector_info['booked_minutes'] = 0
+                inspector_info['has_existing_shifts'] = False
+                
                 print(f"  {insp['full_name']}: {raw_capacity}m available (no existing shifts)")
+            
+            decision_data['inspectors_available'].append(inspector_info)
 
         total_demand = sum((ins.get('duration_minutes') or 45) for ins in date_inspections if ins.get('lat') and ins.get('lng'))
         print(f"\nCapacity check for {inspection_date}:")
@@ -616,6 +757,11 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         print(f"  Total available (after shifts): {total_capacity} min")
         if total_capacity > 0:
             print(f"  Utilization: {(total_demand / total_capacity * 100):.1f}%")
+        
+        decision_data['optimization_result']['total_demand_minutes'] = total_demand
+        decision_data['optimization_result']['total_capacity_minutes'] = total_capacity
+        if total_capacity > 0:
+            decision_data['optimization_result']['utilization_percent'] = round(total_demand / total_capacity * 100, 1)
 
         # Build job nodes
         inspection_nodes: List[Dict] = []
@@ -798,15 +944,32 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
         for j, ins in enumerate(inspection_nodes):
             node_index = mgr.NodeToIndex(JOB_OFFSET + j)
             allowed: List[int] = []
+            allowed_names: List[str] = []
             for vehicle_id, insp in enumerate(date_inspectors):
                 if ins['inspection_type'] in insp['can_do_types']:
                     allowed.append(vehicle_id)
+                    allowed_names.append(insp['full_name'])
             if allowed:
                 routing.SetAllowedVehiclesForIndex(allowed, node_index)
                 addr = (ins.get('address') or '')[:40]
                 print(f"  {ins['inspection_type']} @ {addr} → vehicles {allowed}")
+                
+                # Collect skill constraint for AI
+                decision_data['skill_constraints'].append({
+                    'inspection_type': ins['inspection_type'],
+                    'address': ins.get('address', 'Ukendt'),
+                    'qualified_inspectors': allowed_names,
+                    'qualified_count': len(allowed_names)
+                })
             else:
                 print(f"  WARNING: No qualified inspector for {ins['inspection_type']}")
+                decision_data['skill_constraints'].append({
+                    'inspection_type': ins['inspection_type'],
+                    'address': ins.get('address', 'Ukendt'),
+                    'qualified_inspectors': [],
+                    'qualified_count': 0,
+                    'warning': 'Ingen kvalificerede synskonsulenter'
+                })
 
         # Big penalty for dropping jobs
         BIG_DROP_PENALTY = 1_000_000_000
@@ -851,6 +1014,11 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
             index = routing.Start(v)
             if routing.IsEnd(solution.Value(routing.NextVar(index))):
+                # Inspector not used
+                decision_data['unassigned_inspectors'].append({
+                    'name': name,
+                    'reason': 'Ikke nødvendig - andre synskonsulenter dækkede behovet mere effektivt'
+                })
                 continue
 
             # Build route
@@ -906,6 +1074,7 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
             sequence = 0
             prev_node = starts[v]  # Initialize prev_node to home
+            inspector_route = []
             
             # Iterate through jobs
             for node in route_nodes:
@@ -947,7 +1116,8 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 current_min = end_minute
 
                 sequence += 1
-                all_assignments.append({
+                
+                assignment = {
                     'inspection_id': job['id'],
                     'inspector_id': insp['inspector_id'],
                     'scheduled_date': inspection_date,
@@ -955,6 +1125,18 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                     'end_time': (day_midnight + timedelta(minutes=end_minute)).time().isoformat(),
                     'sequence_in_route': sequence,
                     'travel_from_previous_mins': travel_min_to_here
+                }
+                all_assignments.append(assignment)
+                
+                # Collect for AI explanation
+                inspector_route.append({
+                    'sequence': sequence,
+                    'address': job.get('address', 'Ukendt'),
+                    'inspection_type': job['inspection_type'],
+                    'start_time': start_dt.time().strftime('%H:%M'),
+                    'end_time': (day_midnight + timedelta(minutes=end_minute)).time().strftime('%H:%M'),
+                    'travel_minutes': travel_min_to_here,
+                    'service_minutes': duration
                 })
 
                 print(f"  {name}: Seq {sequence}: {job['inspection_type']} @ {job.get('address', '?')[:40]} | {start_dt.strftime('%H:%M')}-{(day_midnight + timedelta(minutes=end_minute)).strftime('%H:%M')} | travel from prev: {travel_min_to_here}m, service: {duration}m")
@@ -979,6 +1161,16 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
                 last_addr = inspection_nodes[route_nodes[-1] - JOB_OFFSET].get('address') if route_nodes[-1] >= JOB_OFFSET else "HOME"
                 back_km = kmdeci_matrix[route_nodes[-1]][ends[v]] / 10.0
                 print(f"  {name}: → HOME from {last_addr} ({back_km:.1f} km)")
+            
+            # Collect assignment for AI
+            if inspector_route:
+                decision_data['assignments'].append({
+                    'inspector_name': name,
+                    'home_address': insp.get('home_address', 'Ukendt'),
+                    'total_inspections': len(inspector_route),
+                    'total_travel_minutes': sum(r['travel_minutes'] for r in inspector_route),
+                    'route': inspector_route
+                })
 
         metrics['total_travel_km'] += total_km_deci / 10.0
 
@@ -1010,6 +1202,15 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
     metrics['execution_seconds'] = (datetime.now() - start_time).total_seconds()
     metrics['total_unscheduled'] = len(inspections) - metrics['total_scheduled']
+    
+    # Final optimization result for AI
+    decision_data['optimization_result']['total_scheduled'] = metrics['total_scheduled']
+    decision_data['optimization_result']['total_unscheduled'] = metrics['total_unscheduled']
+    decision_data['optimization_result']['total_travel_minutes'] = metrics['total_travel_minutes']
+    decision_data['optimization_result']['total_travel_km'] = round(metrics['total_travel_km'], 1)
+    decision_data['optimization_result']['execution_seconds'] = round(metrics['execution_seconds'], 1)
+    decision_data['optimization_result']['inspectors_used'] = len(decision_data['assignments'])
+    decision_data['optimization_result']['inspectors_available'] = len(decision_data['inspectors_available'])
 
     print(f"\n{'='*60}")
     print(f"VRP Complete: {metrics['total_scheduled']} scheduled, {metrics['total_unscheduled']} unscheduled")
@@ -1020,14 +1221,15 @@ def run_vrp_for_inspections(inspection_ids: List[str], target_dates: List[str]) 
 
     return {
         'assignments': all_assignments,
-        'metrics': metrics
+        'metrics': metrics,
+        'decision_data': decision_data
     }
 
-def save_vrp_results(assignments, metrics):
+def save_vrp_results(assignments: List[Dict], metrics: Dict, ai_explanation: Optional[str] = None) -> str:
     """Save VRP assignments to proposed_assignments table"""
     run_id = str(uuid.uuid4())
 
-    supabase.table('vrp_runs').insert({
+    vrp_run_data = {
         'id': run_id,
         'inspection_ids': [a['inspection_id'] for a in assignments],
         'target_dates': list(set(a['scheduled_date'] for a in assignments)),
@@ -1038,7 +1240,13 @@ def save_vrp_results(assignments, metrics):
         'requested_by': 'api',
         'triggered_by': 'api',
         'total_travel_km': metrics.get('total_travel_km', None),
-    }).execute()
+    }
+    
+    # Add AI explanation if available
+    if ai_explanation:
+        vrp_run_data['ai_explanation'] = ai_explanation
+
+    supabase.table('vrp_runs').insert(vrp_run_data).execute()
 
     for assignment in assignments:
         supabase.table('proposed_assignments').insert({
